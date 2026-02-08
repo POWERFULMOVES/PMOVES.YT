@@ -5,7 +5,7 @@ NATS service discovery announcer for all PMOVES services.
 Publishes service announcements to the services.announce.v1 subject.
 
 Usage:
-    from service_announcer import ServiceAnnouncer, announce_service
+    from pmoves_announcer import ServiceAnnouncer, announce_service
 
     # Create announcement
     announcer = ServiceAnnouncer(
@@ -32,9 +32,9 @@ Usage:
 import asyncio
 import json
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Optional
 from enum import Enum
 
 
@@ -66,10 +66,10 @@ class ServiceAnnouncement:
     tier: ServiceTier
     port: int
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    # NATS subject for announcements
-    SUBJECT: str = 'services.announce.v1'
+    # NATS subject for announcements - ClassVar so it's not a dataclass field
+    SUBJECT: ClassVar[str] = 'services.announce.v1'
 
     def to_json(self) -> str:
         """Convert to JSON for NATS publishing."""
@@ -116,9 +116,9 @@ class ServiceAnnouncer:
         url: str,
         port: int,
         tier: ServiceTier | str,
-        health_check: str = None,
-        nats_url: str = None,
-        metadata: Dict[str, Any] = None,
+        health_check: Optional[str] = None,
+        nats_url: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ):
         """
         Initialize the service announcer.
@@ -167,11 +167,12 @@ class ServiceAnnouncer:
             True if announcement published successfully
         """
         try:
-            from nats.aio.client import Client as NATS
+            # Use the module-level nats.connect() helper, not Client.connect()
+            import nats
 
             announcement = self.create_announcement()
 
-            nc = await NATS.connect(self.nats_url, connect_timeout=5)
+            nc = await nats.connect(self.nats_url, connect_timeout=5)
             await nc.publish(
                 ServiceAnnouncement.SUBJECT,
                 announcement.to_json().encode(),
@@ -185,7 +186,9 @@ class ServiceAnnouncer:
             return False
 
     async def announce_with_retry(
-        self, max_retries: int = 3, delay: float = 1.0
+        self,
+        max_retries: int = 3,
+        delay: float = 1.0,
     ) -> bool:
         """
         Announce service with retry logic.
@@ -211,9 +214,9 @@ async def announce_service(
     url: str,
     port: int,
     tier: ServiceTier | str,
-    health_check: str = None,
-    nats_url: str = None,
-    metadata: Dict[str, Any] = None,
+    health_check: Optional[str] = None,
+    nats_url: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
 ) -> bool:
     """
     Convenience function to announce a service.
@@ -289,8 +292,7 @@ class BackgroundAnnouncer:
         if not self._running:
             self._running = True
             self._task = asyncio.create_task(self._announce_loop())
-            # Initial announcement
-            await self.announcer.announce()
+            # Note: No initial announcement here - _announce_loop will announce immediately
 
     async def stop(self):
         """Stop background announcements."""

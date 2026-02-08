@@ -15,7 +15,7 @@ Usage:
 
 from datetime import datetime
 from functools import wraps
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable
 import os
 import asyncio
 
@@ -96,8 +96,9 @@ class NATSCheck(DependencyCheck):
 
     async def check(self) -> bool:
         try:
-            from nats.aio.client import Client as NATS
-            nc = await NATS.connect(self.nats_url, connect_timeout=2)
+            # Use the module-level nats.connect() helper, not Client.connect()
+            import nats
+            nc = await nats.connect(self.nats_url, connect_timeout=2)
             await nc.close()
             return True
         except Exception:
@@ -109,8 +110,8 @@ class HealthChecker:
 
     def __init__(self, service_name: str = None):
         self.service_name = service_name or os.getenv('SERVICE_NAME', 'unknown')
-        self.checks: List[DependencyCheck] = []
-        self.custom_checks: Dict[str, Callable] = {}
+        self.checks: list[DependencyCheck] = []
+        self.custom_checks: dict[str, Callable] = {}
 
     def add_check(self, check: DependencyCheck) -> None:
         """Add a dependency check."""
@@ -132,7 +133,7 @@ class HealthChecker:
         """Add a NATS health check."""
         self.add_check(NATSCheck(nats_url))
 
-    async def check_all(self) -> Dict[str, Any]:
+    async def check_all(self) -> dict[str, Any]:
         """Run all health checks and return status."""
         results = {
             'status': HealthStatus.HEALTHY,
@@ -185,15 +186,21 @@ class HealthChecker:
 _health_checker = HealthChecker()
 
 
-def health_check(checks: List[DependencyCheck] = None):
-    """Decorator to add health checks to a function."""
+def health_check(checks: list[DependencyCheck] | None = None):
+    """
+    Decorator to add health checks to a function.
+
+    Checks are registered once at decoration time, not on each call.
+    This prevents duplicate registrations when the decorated function is called repeatedly.
+    """
+    # Register checks immediately when decorator is applied (not on each call)
+    if checks:
+        for check in checks:
+            _health_checker.add_check(check)
+
     def decorator(func: Callable):
         @wraps(func)
         async def wrapper(*args, **kwargs):
-            checker = _health_checker
-            if checks:
-                for check in checks:
-                    checker.add_check(check)
             return await func(*args, **kwargs)
         return wrapper
     return decorator
@@ -219,7 +226,7 @@ def add_custom_check(name: str, check_fn: Callable) -> None:
     _health_checker.add_custom_check(name, check_fn)
 
 
-async def get_health_status() -> Dict[str, Any]:
+async def get_health_status() -> dict[str, Any]:
     """Get current health status."""
     return await _health_checker.check_all()
 

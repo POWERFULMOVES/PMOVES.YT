@@ -8,7 +8,7 @@ Service discovery using the PMOVES service registry with fallback chain:
 4. Docker DNS (development fallback)
 
 Usage:
-    from service_registry import get_service_url, ServiceInfo
+    from pmoves_registry import get_service_url, ServiceInfo
 
     # Simple URL resolution
     url = await get_service_url('hirag-v2')
@@ -132,7 +132,7 @@ async def get_service_info(
 
     Resolution order:
         1. Environment variable override
-        2. Constructed URL (with warning)
+        2. DNS-based fallback (always succeeds)
 
     Args:
         slug: Service slug to resolve
@@ -140,9 +140,6 @@ async def get_service_info(
 
     Returns:
         ServiceInfo with service metadata
-
-    Raises:
-        ServiceNotFoundError: If service cannot be resolved
     """
     # 1. Check environment variable override
     if env_url := _get_env_url(slug):
@@ -150,7 +147,7 @@ async def get_service_info(
             slug=slug,
             name=f'{slug} (from env)',
             description='Service URL from environment variable',
-            health_check_url=env_url,
+            health_check_url=env_url.rstrip('/') + '/healthz',
             default_port=default_port,
             tier=ServiceTier.API,  # Default tier
         )
@@ -161,7 +158,7 @@ async def get_service_info(
         slug=slug,
         name=f'{slug} (fallback)',
         description='Service resolved via Docker DNS fallback',
-        health_check_url=fallback_url,
+        health_check_url=fallback_url + '/healthz',
         default_port=default_port,
         tier=ServiceTier.API,
     )
@@ -248,7 +245,7 @@ class CommonServices:
     NATS = 'nats://nats:4222'
 
     @classmethod
-    def get(cls, service: str) -> str:
+    def get(cls, service: str) -> str | None:
         """Get a common service URL by name."""
         return getattr(cls, service.upper(), None)
 
