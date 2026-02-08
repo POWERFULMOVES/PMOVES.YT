@@ -13,14 +13,15 @@ Usage:
     app.include_router(health_check_router)
 """
 
-from datetime import datetime
+from collections.abc import Callable
+from datetime import datetime, timezone
 from functools import wraps
-from typing import Any, Callable
+from typing import Any
 import os
 import asyncio
 
 try:
-    from fastapi import APIRouter, HTTPException
+    from fastapi import APIRouter
     from fastapi.responses import JSONResponse
     FASTAPI_AVAILABLE = True
 except ImportError:
@@ -108,14 +109,15 @@ class NATSCheck(DependencyCheck):
 class HealthChecker:
     """Health checker with multiple dependency checks."""
 
-    def __init__(self, service_name: str = None):
+    def __init__(self, service_name: str | None = None):
         self.service_name = service_name or os.getenv('SERVICE_NAME', 'unknown')
         self.checks: list[DependencyCheck] = []
         self.custom_checks: dict[str, Callable] = {}
 
     def add_check(self, check: DependencyCheck) -> None:
-        """Add a dependency check."""
-        self.checks.append(check)
+        """Add a dependency check with deduplication guard."""
+        if check not in self.checks:
+            self.checks.append(check)
 
     def add_custom_check(self, name: str, check_fn: Callable) -> None:
         """Add a custom health check function."""
@@ -138,7 +140,7 @@ class HealthChecker:
         results = {
             'status': HealthStatus.HEALTHY,
             'service': self.service_name,
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
         }
 
         all_healthy = True
@@ -155,7 +157,7 @@ class HealthChecker:
                         all_healthy = False
                     else:
                         some_degraded = True
-            except Exception as e:
+            except Exception:
                 results[check.status_key()] = False
                 if check.required:
                     all_healthy = False
@@ -241,14 +243,14 @@ if FASTAPI_AVAILABLE:
         """Standard health check endpoint."""
         return await get_health_status()
 
-    def create_health_app(service_name: str = None) -> 'FastAPI':
+    def create_health_app(service_name: str | None = None) -> 'FastAPI':
         """Create a minimal FastAPI app with health check."""
         from fastapi import FastAPI
         app = FastAPI(title=service_name or 'PMOVES Service')
         app.include_router(health_check_router)
         return app
 else:
-    def create_health_app(service_name: str = None):
+    def create_health_app(service_name: str | None = None):
         """Raise error if FastAPI not available."""
         raise ImportError('FastAPI is required to create health app')
 

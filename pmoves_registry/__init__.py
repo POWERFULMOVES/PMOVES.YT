@@ -85,9 +85,9 @@ def _get_env_url(slug: str) -> str | None:
     Check for environment variable override.
 
     Environment variables are checked in the following order:
-    1. <SLUG>_URL (e.g., HIRAG_V2_URL)
-    2. <SLUG WITH DASHES>_URL (e.g., HIRAG-V2-URL)
-    3. UPPERCASE_SLUG_URL (e.g., HIRAGV2_URL)
+    1. slug with dashes replaced by underscores (e.g., 'hirag-v2' -> HIRAG_V2_URL)
+    2. slug with dashes removed (e.g., 'hirag-v2' -> HIRAGV2_URL)
+    3. original uppercase slug with dashes preserved (e.g., 'hirag-v2' -> HIRAG-V2_URL)
 
     Args:
         slug: Service slug (e.g., 'hirag-v2')

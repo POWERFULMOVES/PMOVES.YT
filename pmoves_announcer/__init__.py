@@ -30,11 +30,12 @@ Usage:
 """
 
 import asyncio
+import contextlib
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, ClassVar, Optional
+from datetime import datetime, timezone
+from typing import Any, ClassVar
 from enum import Enum
 
 
@@ -65,7 +66,7 @@ class ServiceAnnouncement:
     health_check: str
     tier: ServiceTier
     port: int
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     metadata: dict[str, Any] = field(default_factory=dict)
 
     # NATS subject for announcements - ClassVar so it's not a dataclass field
@@ -97,7 +98,7 @@ class ServiceAnnouncement:
             health_check=data['health_check'],
             tier=ServiceTier(data['tier']),
             port=data['port'],
-            timestamp=data.get('timestamp', datetime.utcnow().isoformat()),
+            timestamp=data.get('timestamp', datetime.now(timezone.utc).isoformat()),
             metadata=data.get('metadata', {}),
         )
 
@@ -116,9 +117,9 @@ class ServiceAnnouncer:
         url: str,
         port: int,
         tier: ServiceTier | str,
-        health_check: Optional[str] = None,
-        nats_url: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
+        health_check: str | None = None,
+        nats_url: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ):
         """
         Initialize the service announcer.
@@ -155,7 +156,7 @@ class ServiceAnnouncer:
             health_check=self.health_check,
             tier=self.tier,
             port=self.port,
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             metadata=self.metadata,
         )
 
@@ -214,9 +215,9 @@ async def announce_service(
     url: str,
     port: int,
     tier: ServiceTier | str,
-    health_check: Optional[str] = None,
-    nats_url: Optional[str] = None,
-    metadata: Optional[dict[str, Any]] = None,
+    health_check: str | None = None,
+    nats_url: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> bool:
     """
     Convenience function to announce a service.
@@ -279,7 +280,7 @@ class BackgroundAnnouncer:
         self.announcer = announcer
         self.interval = interval
         self._running = False
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task[None] | None = None
 
     async def _announce_loop(self):
         """Internal announcement loop."""
@@ -292,7 +293,6 @@ class BackgroundAnnouncer:
         if not self._running:
             self._running = True
             self._task = asyncio.create_task(self._announce_loop())
-            # Note: No initial announcement here - _announce_loop will announce immediately
 
     async def stop(self):
         """Stop background announcements."""
@@ -300,10 +300,8 @@ class BackgroundAnnouncer:
             self._running = False
             if self._task:
                 self._task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await self._task
-                except asyncio.CancelledError:
-                    pass
 
 
 # Example usage and testing

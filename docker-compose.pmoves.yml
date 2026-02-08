@@ -6,26 +6,17 @@
 # Usage:
 #   services:
 #     my-service:
-#       <<: *env-tier-api
+#       <<: [*env-tier-api, *pmoves-healthcheck, *pmoves-labels]
 #       environment:
 #         SERVICE_NAME: my-service
-#         SERVICE_SPECIFIC_VAR: value
-
-version: "3.8"
-
-# PMOVES.AI Environment Loading Anchors
-# These anchors provide tier-based environment loading
-#
-# IMPORTANT: Docker Compose YAML merge (<<:) replaces lists, not deep-merges.
-# When using tier anchors, base environment variables from pmoves-env-base are
-# preserved because each tier anchor includes all base variables.
+#         SERVICE_PORT: 8080
 
 # Base Environment (all tiers)
 x-pmoves-env: &pmoves-env-base
   env_file:
     - env.shared
   environment:
-    PMOVES_ENV: ${PMOVES_ENV:-production}
+    PMOVES_ENV: ${PMOVES_ENV:-development}
     TIER: ${TIER}
     NATS_URL: ${NATS_URL:-nats://nats:4222}
     TENSORZERO_URL: ${TENSORZERO_URL:-http://tensorzero-gateway:3030}
@@ -36,7 +27,7 @@ x-env-tier-api: &env-tier-api
     - env.shared
   environment:
     # Base variables (from pmoves-env-base)
-    PMOVES_ENV: ${PMOVES_ENV:-production}
+    PMOVES_ENV: ${PMOVES_ENV:-development}
     TIER: api
     NATS_URL: ${NATS_URL:-nats://nats:4222}
     TENSORZERO_URL: ${TENSORZERO_URL:-http://tensorzero-gateway:3030}
@@ -50,7 +41,7 @@ x-env-tier-agent: &env-tier-agent
     - env.shared
   environment:
     # Base variables
-    PMOVES_ENV: ${PMOVES_ENV:-production}
+    PMOVES_ENV: ${PMOVES_ENV:-development}
     TIER: agent
     NATS_URL: ${NATS_URL:-nats://nats:4222}
     TENSORZERO_URL: ${TENSORZERO_URL:-http://tensorzero-gateway:3030}
@@ -64,7 +55,7 @@ x-env-tier-worker: &env-tier-worker
     - env.shared
   environment:
     # Base variables
-    PMOVES_ENV: ${PMOVES_ENV:-production}
+    PMOVES_ENV: ${PMOVES_ENV:-development}
     TIER: worker
     NATS_URL: ${NATS_URL:-nats://nats:4222}
     TENSORZERO_URL: ${TENSORZERO_URL:-http://tensorzero-gateway:3030}
@@ -78,7 +69,7 @@ x-env-tier-data: &env-tier-data
     - env.shared
   environment:
     # Base variables
-    PMOVES_ENV: ${PMOVES_ENV:-production}
+    PMOVES_ENV: ${PMOVES_ENV:-development}
     TIER: data
     NATS_URL: ${NATS_URL:-nats://nats:4222}
     TENSORZERO_URL: ${TENSORZERO_URL:-http://tensorzero-gateway:3030}
@@ -91,7 +82,7 @@ x-env-tier-llm: &env-tier-llm
     - env.shared
   environment:
     # Base variables
-    PMOVES_ENV: ${PMOVES_ENV:-production}
+    PMOVES_ENV: ${PMOVES_ENV:-development}
     TIER: llm
     NATS_URL: ${NATS_URL:-nats://nats:4222}
     TENSORZERO_URL: ${TENSORZERO_URL:-http://tensorzero-gateway:3030}
@@ -104,7 +95,7 @@ x-env-tier-media: &env-tier-media
     - env.shared
   environment:
     # Base variables
-    PMOVES_ENV: ${PMOVES_ENV:-production}
+    PMOVES_ENV: ${PMOVES_ENV:-development}
     TIER: media
     NATS_URL: ${NATS_URL:-nats://nats:4222}
     TENSORZERO_URL: ${TENSORZERO_URL:-http://tensorzero-gateway:3030}
@@ -118,12 +109,15 @@ x-env-tier-ui: &env-tier-ui
     - env.shared
   environment:
     # Base variables
-    PMOVES_ENV: ${PMOVES_ENV:-production}
+    PMOVES_ENV: ${PMOVES_ENV:-development}
     TIER: ui
     NATS_URL: ${NATS_URL:-nats://nats:4222}
     TENSORZERO_URL: ${TENSORZERO_URL:-http://tensorzero-gateway:3030}
 
-# Health check template (with configurable port)
+# Health check template
+# Note: The SERVICE_PORT here is interpolated from the host environment or .env file,
+# NOT from the service's environment block. Set it in your .env or host env before
+# running docker compose, or override healthcheck.test explicitly in each service.
 x-pmoves-healthcheck: &pmoves-healthcheck
   healthcheck:
     test: ["CMD", "curl", "-f", "http://localhost:${SERVICE_PORT:-8080}/healthz"]
@@ -143,33 +137,29 @@ x-pmoves-gpu: &pmoves-gpu-resource
             capabilities: [gpu]
 
 # Service labels for Prometheus discovery
-# Note: Prometheus uses slash (/) as separator, not dot (.)
+# Prometheus uses slash (/) as separator for annotations
 x-pmoves-labels: &pmoves-labels
   labels:
     pmoves.service: "true"
     prometheus.io/scrape: "true"
-    prometheus.io/port: "${METRICS_PORT:-9090}"
+    prometheus.io/port: "${METRICS_PORT:-9180}"
     prometheus.io/path: "/metrics"
 
 # Example service definition using the templates:
 #
 # services:
 #   my-api-service:
-#     <<: *env-tier-api
-#     <<: *pmoves-healthcheck
-#     <<: *pmoves-labels
+#     <<: [*env-tier-api, *pmoves-healthcheck, *pmoves-labels]
 #     image: ghcr.io/powerfulmoves/my-service:latest
 #     ports:
 #       - "8080:8080"
 #     environment:
 #       SERVICE_NAME: my-api-service
 #       SERVICE_PORT: 8080
-#       METRICS_PORT: 9090
+#       METRICS_PORT: 9180
 #
 #   my-gpu-worker:
-#     <<: *env-tier-worker
-#     <<: *pmoves-gpu-resource
-#     <<: *pmoves-healthcheck
+#     <<: [*env-tier-worker, *pmoves-gpu-resource, *pmoves-healthcheck]
 #     image: ghcr.io/powerfulmoves/my-gpu-worker:latest
 #     environment:
 #       SERVICE_NAME: my-gpu-worker

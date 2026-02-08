@@ -30,12 +30,12 @@ services:
 
 Edit the following files with your service-specific values:
 
-- `env.shared` - Base environment configuration (Docker Compose format)
-- `env.shared.sh` - Base environment configuration (shell format with `export`)
-- `env.tier-worker` - Worker tier configuration (Docker Compose format)
-- `env.tier-worker.sh` - Worker tier configuration (shell format)
+- `env.shared` / `env.shared.sh` - Base environment configuration
+- `env.tier-worker` / `env.tier-worker.sh` - Tier-specific environment
 
 Note: Both formats are provided for flexibility. The `.sh` files use `export` for shell sourcing, while non-`.sh` files use plain `KEY=value` for Docker Compose.
+
+**Important:** Set actual credentials before running in production. Default values are intentionally empty to fail fast.
 
 ### 2. Update Docker Compose
 
@@ -44,19 +44,17 @@ Add the PMOVES.AI environment anchor to your `docker-compose.yml`:
 ```yaml
 services:
   pmoves-yt:
-    <<: *env-tier-worker
-    <<: *pmoves-healthcheck
-    <<: *pmoves-labels
+    <<: [*env-tier-worker, *pmoves-healthcheck, *pmoves-labels]
     image: ghcr.io/powerfulmoves/pmoves-yt:latest
     ports:
       - "8077:8077"
     environment:
       SERVICE_NAME: pmoves-yt
       SERVICE_PORT: 8077
-      METRICS_PORT: 9077
+      METRICS_PORT: 9180
 ```
 
-Important: Use separate `<<:` merge directives for each anchor (not array syntax).
+**Important:** Use the array merge form `<<: [*anchor1, *anchor2, ...]` not separate `<<:` directives.
 
 ### 3. Integrate Health Check
 
@@ -72,13 +70,15 @@ async def health_check():
 
 ### 4. Add Service Announcement
 
-Add NATS service announcement to your startup:
+Add NATS service announcement to your startup using the lifespan pattern:
 
 ```python
+from contextlib import asynccontextmanager
 from pmoves_announcer import announce_service
 
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app):
+    # Startup
     await announce_service(
         slug="pmoves-yt",
         name="PMOVES YT",
@@ -86,7 +86,13 @@ async def startup():
         port=8077,
         tier="worker"
     )
+    yield
+    # Shutdown (if needed)
+
+app = FastAPI(lifespan=lifespan)
 ```
+
+Note: The `@app.on_event("startup")` decorator is deprecated in FastAPI. Use the `lifespan` context manager instead.
 
 ### 5. Test Integration
 
@@ -108,7 +114,7 @@ nats sub "services.announce.v1"
 - **Tier:** worker
 - **Port:** 8077
 - **Health Check:** http://localhost:8077/healthz
-- **Metrics:** http://localhost:9077/metrics
+- **Metrics:** http://localhost:9180/metrics
 - **NATS Enabled:** True
 - **GPU Enabled:** False
 
@@ -124,13 +130,13 @@ nats sub "services.announce.v1"
 
 ## Docker Compose Notes
 
-1. **YAML Merge Behavior**: The `<<:` anchor merge replaces lists entirely. Each tier anchor includes all base environment variables explicitly to avoid losing NATS_URL, TENSORZERO_URL, etc.
+1. **YAML Merge Syntax**: Use `<<: [*anchor1, *anchor2]` for multiple anchors. Do not use separate `<<:` directives as this violates YAML spec.
 
-2. **Environment Format**: Use mapping syntax (`KEY: value`) not array syntax (`- KEY=value`) for better readability and variable substitution.
+2. **Environment Format**: Use mapping syntax (`KEY: value`) not array syntax (`- KEY=value`) for better readability.
 
-3. **Multiple Anchors**: When using multiple anchors, use separate `<<:` directives (not `<<: [*anchor1, *anchor2]`).
+3. **Health Check Ports**: The `${SERVICE_PORT:-8080}` in healthcheck is interpolated from the host environment or `.env` file, NOT from the service's `environment` block. Set it in your `.env` file before running docker compose, or override `healthcheck.test` explicitly per service.
 
-4. **Configurable Ports**: Health check uses `${SERVICE_PORT:-8080}` for port flexibility. Set `SERVICE_PORT` or `METRICS_PORT` in your service environment.
+4. **Prometheus Labels**: Labels use slash separator (`prometheus.io/port`) not dot (`prometheus.io.port`).
 
 ## Support
 
