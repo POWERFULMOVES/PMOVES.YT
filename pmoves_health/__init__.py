@@ -16,9 +16,12 @@ Usage:
 from collections.abc import Callable
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import os
 import asyncio
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
 
 try:
     from fastapi import APIRouter
@@ -242,7 +245,7 @@ if FASTAPI_AVAILABLE:
         """Standard health check endpoint."""
         return await get_health_status()
 
-    def create_health_app(service_name: str | None = None) -> 'FastAPI':
+    def create_health_app(service_name: str | None = None) -> FastAPI:
         """Create a minimal FastAPI app with health check."""
         from fastapi import FastAPI
         app = FastAPI(title=service_name or 'PMOVES Service')
