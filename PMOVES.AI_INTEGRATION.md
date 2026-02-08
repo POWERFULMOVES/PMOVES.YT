@@ -120,7 +120,11 @@ services:
       METRICS_PORT: 9180
 ```
 
-**Important:** Use the array merge form `<<: [*anchor1, *anchor2, ...]` not separate `<<:` directives.
+**Important:** Use the array merge form `<<: [*anchor1, *anchor2, ...]` not separate `<<:` directives. This preserves list merges and is more reliable.
+
+**Note on healthcheck ports:** The `${SERVICE_PORT:-8080}` in the healthcheck template is interpolated from the host environment (or `.env` file), not from the service's `environment` block. To override the port, either:
+- Set `SERVICE_PORT` in your host environment or `.env` file before running `docker compose`
+- Or override `healthcheck.test` explicitly in each service with the concrete URL
 
 ### 3. Integrate Health Check
 

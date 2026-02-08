@@ -22,7 +22,6 @@ import asyncio
 
 try:
     from fastapi import APIRouter
-    from fastapi.responses import JSONResponse
     FASTAPI_AVAILABLE = True
 except ImportError:
     FASTAPI_AVAILABLE = False

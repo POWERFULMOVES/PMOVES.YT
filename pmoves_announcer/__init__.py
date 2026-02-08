@@ -32,11 +32,14 @@ Usage:
 import asyncio
 import contextlib
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, ClassVar
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 class ServiceTier(str, Enum):
@@ -183,7 +186,7 @@ class ServiceAnnouncer:
 
             return True
         except Exception as e:
-            print(f'Failed to announce service: {e}')
+            logger.warning(f'Failed to announce service: {e}')
             return False
 
     async def announce_with_retry(
@@ -317,7 +320,7 @@ if __name__ == '__main__':
             port=8080,
             tier='api',
         )
-        print('Service announced!')
+        logger.info('Service announced!')
 
         # Example 2: With metadata
         await announce_service(
@@ -343,7 +346,7 @@ if __name__ == '__main__':
         )
         bg = BackgroundAnnouncer(announcer, interval=30)
         await bg.start()
-        print('Background announcer started (30s interval)')
+        logger.info('Background announcer started (30s interval)')
 
         # Keep running...
         await asyncio.sleep(10)
