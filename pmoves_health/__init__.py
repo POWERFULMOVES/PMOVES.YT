@@ -28,15 +28,15 @@ except ImportError:
 
 
 # Health check configuration
-HEALTH_CHECK_PATH = "/healthz"
+HEALTH_CHECK_PATH = '/healthz'
 HEALTH_CHECK_TIMEOUT = 5.0
 
 
 class HealthStatus:
     """Health status constants."""
-    HEALTHY = "healthy"
-    DEGRADED = "degraded"
-    UNHEALTHY = "unhealthy"
+    HEALTHY = 'healthy'
+    DEGRADED = 'degraded'
+    UNHEALTHY = 'unhealthy'
 
 
 class DependencyCheck:
@@ -52,14 +52,14 @@ class DependencyCheck:
 
     def status_key(self) -> str:
         """Return the status key for this check."""
-        return f"{self.name.lower().replace(' ', '_')}_connected"
+        return f'{self.name.lower().replace(" ", "_")}_connected'
 
 
 class DatabaseCheck(DependencyCheck):
     """Health check for database connections."""
 
     def __init__(self, connect_fn: Callable, **kwargs):
-        super().__init__("database", kwargs.get("required", True))
+        super().__init__('database', kwargs.get('required', True))
         self.connect_fn = connect_fn
 
     async def check(self) -> bool:
@@ -73,8 +73,8 @@ class HTTPCheck(DependencyCheck):
     """Health check for HTTP endpoints."""
 
     def __init__(self, url: str, **kwargs):
-        name = kwargs.get("name", "service")
-        super().__init__(name, kwargs.get("required", True))
+        name = kwargs.get('name', 'service')
+        super().__init__(name, kwargs.get('required', True))
         self.url = url
 
     async def check(self) -> bool:
@@ -91,7 +91,7 @@ class NATSCheck(DependencyCheck):
     """Health check for NATS connection."""
 
     def __init__(self, nats_url: str, **kwargs):
-        super().__init__("nats", kwargs.get("required", True))
+        super().__init__('nats', kwargs.get('required', True))
         self.nats_url = nats_url
 
     async def check(self) -> bool:
@@ -108,7 +108,7 @@ class HealthChecker:
     """Health checker with multiple dependency checks."""
 
     def __init__(self, service_name: str = None):
-        self.service_name = service_name or os.getenv("SERVICE_NAME", "unknown")
+        self.service_name = service_name or os.getenv('SERVICE_NAME', 'unknown')
         self.checks: List[DependencyCheck] = []
         self.custom_checks: Dict[str, Callable] = {}
 
@@ -124,7 +124,7 @@ class HealthChecker:
         """Add a database health check."""
         self.add_check(DatabaseCheck(connect_fn))
 
-    def http(self, url: str, name: str = "service") -> None:
+    def http(self, url: str, name: str = 'service') -> None:
         """Add an HTTP endpoint health check."""
         self.add_check(HTTPCheck(url, name=name))
 
@@ -135,9 +135,9 @@ class HealthChecker:
     async def check_all(self) -> Dict[str, Any]:
         """Run all health checks and return status."""
         results = {
-            "status": HealthStatus.HEALTHY,
-            "service": self.service_name,
-            "timestamp": datetime.utcnow().isoformat(),
+            'status': HealthStatus.HEALTHY,
+            'service': self.service_name,
+            'timestamp': datetime.utcnow().isoformat(),
         }
 
         all_healthy = True
@@ -174,9 +174,9 @@ class HealthChecker:
 
         # Determine overall status
         if not all_healthy:
-            results["status"] = HealthStatus.UNHEALTHY
+            results['status'] = HealthStatus.UNHEALTHY
         elif some_degraded:
-            results["status"] = HealthStatus.DEGRADED
+            results['status'] = HealthStatus.DEGRADED
 
         return results
 
@@ -204,7 +204,7 @@ def add_database_check(connect_fn: Callable) -> None:
     _health_checker.database(connect_fn)
 
 
-def add_http_check(url: str, name: str = "service") -> None:
+def add_http_check(url: str, name: str = 'service') -> None:
     """Add an HTTP endpoint health check."""
     _health_checker.http(url, name)
 
@@ -234,36 +234,36 @@ if FASTAPI_AVAILABLE:
         """Standard health check endpoint."""
         return await get_health_status()
 
-    def create_health_app(service_name: str = None) -> "FastAPI":
+    def create_health_app(service_name: str = None) -> 'FastAPI':
         """Create a minimal FastAPI app with health check."""
         from fastapi import FastAPI
-        app = FastAPI(title=service_name or "PMOVES Service")
+        app = FastAPI(title=service_name or 'PMOVES Service')
         app.include_router(health_check_router)
         return app
 else:
     def create_health_app(service_name: str = None):
         """Raise error if FastAPI not available."""
-        raise ImportError("FastAPI is required to create health app")
+        raise ImportError('FastAPI is required to create health app')
 
 
 # Example usage
-if __name__ == "__main__":
+if __name__ == '__main__':
     async def example_usage():
         """Example of how to use the health checker."""
 
         # Create a health checker
-        checker = HealthChecker("example-service")
+        checker = HealthChecker('example-service')
 
         # Add checks
-        checker.nats("nats://nats:4222")
-        checker.http("http://supabase:8000", name="supabase")
+        checker.nats('nats://nats:4222')
+        checker.http('http://supabase:8000', name='supabase')
 
         # Add custom check
         async def check_memory():
             import psutil
             return psutil.virtual_memory().percent < 90
 
-        checker.add_custom_check("memory_ok", check_memory)
+        checker.add_custom_check('memory_ok', check_memory)
 
         # Run checks
         status = await checker.check_all()

@@ -11,11 +11,11 @@ Usage:
     from service_registry import get_service_url, ServiceInfo
 
     # Simple URL resolution
-    url = await get_service_url("hirag-v2")
+    url = await get_service_url('hirag-v2')
 
     # Get full service info
-    info = await get_service_info("hirag-v2")
-    print(f"{info.name}: {info.health_check_url}")
+    info = await get_service_info('hirag-v2')
+    print(f'{info.name}: {info.health_check_url}')
 """
 
 import asyncio
@@ -27,14 +27,14 @@ from typing import Any, Optional
 
 class ServiceTier(str, Enum):
     """PMOVES service tiers."""
-    DATA = "data"
-    API = "api"
-    LLM = "llm"
-    MEDIA = "media"
-    AGENT = "agent"
-    WORKER = "worker"
-    APP = "app"
-    UI = "ui"
+    DATA = 'data'
+    API = 'api'
+    LLM = 'llm'
+    MEDIA = 'media'
+    AGENT = 'agent'
+    WORKER = 'worker'
+    APP = 'app'
+    UI = 'ui'
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,7 @@ class ServiceInfo:
     Immutable service metadata from the service catalog.
 
     Attributes:
-        slug: Unique service identifier (e.g., "hirag-v2", "agent-zero")
+        slug: Unique service identifier (e.g., 'hirag-v2', 'agent-zero')
         name: Human-readable service name
         description: Service description
         health_check_url: Full URL to health check endpoint
@@ -65,11 +65,11 @@ class ServiceInfo:
     def base_url(self) -> str:
         """Extract base URL from health_check_url."""
         url = self.health_check_url
-        for suffix in ("/healthz", "/health", "/metrics", "/ping"):
+        for suffix in ('/healthz', '/health', '/metrics', '/ping'):
             if url.endswith(suffix):
                 url = url[: -len(suffix)]
                 break
-        return url.rstrip("/")
+        return url.rstrip('/')
 
 
 class ServiceNotFoundError(Exception):
@@ -90,15 +90,15 @@ def _get_env_url(slug: str) -> str | None:
     3. UPPERCASE_SLUG_URL (e.g., HIRAGV2_URL)
 
     Args:
-        slug: Service slug (e.g., "hirag-v2")
+        slug: Service slug (e.g., 'hirag-v2')
 
     Returns:
         URL from environment or None
     """
     env_var_patterns = [
-        slug.upper().replace("-", "_") + "_URL",  # HIRAG_V2_URL
-        slug.upper().replace("-", "") + "_URL",  # HIRAGV2_URL
-        slug.upper() + "_URL",  # HIRAG-V2_URL
+        slug.upper().replace('-', '_') + '_URL',  # HIRAG_V2_URL
+        slug.upper().replace('-', '') + '_URL',  # HIRAGV2_URL
+        slug.upper() + '_URL',  # HIRAG-V2_URL
     ]
 
     for pattern in env_var_patterns:
@@ -119,7 +119,7 @@ def _fallback_dns_url(slug: str, default_port: int) -> str:
     Returns:
         Fallback service URL
     """
-    return f"http://{slug}:{default_port}"
+    return f'http://{slug}:{default_port}'
 
 
 async def get_service_info(
@@ -148,8 +148,8 @@ async def get_service_info(
     if env_url := _get_env_url(slug):
         return ServiceInfo(
             slug=slug,
-            name=f"{slug} (from env)",
-            description=f"Service URL from environment variable",
+            name=f'{slug} (from env)',
+            description='Service URL from environment variable',
             health_check_url=env_url,
             default_port=default_port,
             tier=ServiceTier.API,  # Default tier
@@ -159,8 +159,8 @@ async def get_service_info(
     fallback_url = _fallback_dns_url(slug, default_port)
     return ServiceInfo(
         slug=slug,
-        name=f"{slug} (fallback)",
-        description=f"Service resolved via Docker DNS fallback",
+        name=f'{slug} (fallback)',
+        description='Service resolved via Docker DNS fallback',
         health_check_url=fallback_url,
         default_port=default_port,
         tier=ServiceTier.API,
@@ -185,8 +185,8 @@ async def get_service_url(
         Resolved service URL
 
     Example:
-        >>> await get_service_url("hirag-v2")
-        "http://hi-rag-gateway-v2:8086"
+        >>> await get_service_url('hirag-v2')
+        'http://hi-rag-gateway-v2:8086'
     """
     info = await get_service_info(slug, default_port=default_port)
     return info.base_url if use_base_url else info.health_check_url
@@ -226,26 +226,26 @@ class CommonServices:
     """Common PMOVES service URLs for quick reference."""
 
     # Agent Coordination
-    AGENT_ZERO = "http://agent-zero:8080"
-    ARCHON = "http://archon:8091"
-    MESH_AGENT = "mesh-agent"  # No HTTP interface
+    AGENT_ZERO = 'http://agent-zero:8080'
+    ARCHON = 'http://archon:8091'
+    MESH_AGENT = 'mesh-agent'  # No HTTP interface
 
     # LLM Gateway
-    TENSORZERO = "http://tensorzero-gateway:3030"
-    TENSORZERO_UI = "http://tensorzero-ui:4000"
+    TENSORZERO = 'http://tensorzero-gateway:3030'
+    TENSORZERO_UI = 'http://tensorzero-ui:4000'
 
     # Retrieval
-    HIRAG_V2 = "http://hi-rag-gateway-v2:8086"
-    HIRAG_V1 = "http://hi-rag-gateway:8089"
+    HIRAG_V2 = 'http://hi-rag-gateway-v2:8086'
+    HIRAG_V1 = 'http://hi-rag-gateway:8089'
 
     # Data Services
-    QDRANT = "http://qdrant:6333"
-    NEO4J = "http://neo4j:7474"
-    MEILISEARCH = "http://meilisearch:7700"
-    MINIO = "http://minio:9000"
+    QDRANT = 'http://qdrant:6333'
+    NEO4J = 'http://neo4j:7474'
+    MEILISEARCH = 'http://meilisearch:7700'
+    MINIO = 'http://minio:9000'
 
     # NATS
-    NATS = "nats://nats:4222"
+    NATS = 'nats://nats:4222'
 
     @classmethod
     def get(cls, service: str) -> str:
@@ -253,21 +253,21 @@ class CommonServices:
         return getattr(cls, service.upper(), None)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     # Example usage
     async def main():
         # Get service URL
-        url = await get_service_url("hirag-v2", default_port=8086)
-        print(f"Hi-RAG URL: {url}")
+        url = await get_service_url('hirag-v2', default_port=8086)
+        print(f'Hi-RAG URL: {url}')
 
         # Check service health
-        healthy = await check_service_health("hirag-v2", default_port=8086)
-        print(f"Hi-RAG Healthy: {healthy}")
+        healthy = await check_service_health('hirag-v2', default_port=8086)
+        print(f'Hi-RAG Healthy: {healthy}')
 
         # Get service info
-        info = await get_service_info("agent-zero", default_port=8080)
-        print(f"Service: {info.name}")
-        print(f"Base URL: {info.base_url}")
-        print(f"Health Check: {info.health_check_url}")
+        info = await get_service_info('agent-zero', default_port=8080)
+        print(f'Service: {info.name}')
+        print(f'Base URL: {info.base_url}')
+        print(f'Health Check: {info.health_check_url}')
 
     asyncio.run(main())

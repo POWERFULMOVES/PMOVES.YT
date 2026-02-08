@@ -9,11 +9,11 @@ Usage:
 
     # Create announcement
     announcer = ServiceAnnouncer(
-        slug="my-service",
-        name="My Service",
-        url="http://my-service:8080",
+        slug='my-service',
+        name='My Service',
+        url='http://my-service:8080',
         port=8080,
-        tier="api"
+        tier='api'
     )
 
     # Announce on startup
@@ -21,11 +21,11 @@ Usage:
 
     # Or use the convenience function
     await announce_service(
-        slug="my-service",
-        name="My Service",
-        url="http://my-service:8080",
+        slug='my-service',
+        name='My Service',
+        url='http://my-service:8080',
         port=8080,
-        tier="api"
+        tier='api'
     )
 """
 
@@ -40,14 +40,14 @@ from enum import Enum
 
 class ServiceTier(str, Enum):
     """PMOVES service tiers."""
-    DATA = "data"
-    API = "api"
-    LLM = "llm"
-    MEDIA = "media"
-    AGENT = "agent"
-    WORKER = "worker"
-    APP = "app"
-    UI = "ui"
+    DATA = 'data'
+    API = 'api'
+    LLM = 'llm'
+    MEDIA = 'media'
+    AGENT = 'agent'
+    WORKER = 'worker'
+    APP = 'app'
+    UI = 'ui'
 
 
 @dataclass
@@ -69,36 +69,36 @@ class ServiceAnnouncement:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     # NATS subject for announcements
-    SUBJECT: str = "services.announce.v1"
+    SUBJECT: str = 'services.announce.v1'
 
     def to_json(self) -> str:
         """Convert to JSON for NATS publishing."""
         data = {
-            "slug": self.slug,
-            "name": self.name,
-            "url": self.url,
-            "health_check": self.health_check,
-            "tier": self.tier.value if isinstance(self.tier, ServiceTier) else self.tier,
-            "port": self.port,
-            "timestamp": self.timestamp,
-            "metadata": self.metadata,
+            'slug': self.slug,
+            'name': self.name,
+            'url': self.url,
+            'health_check': self.health_check,
+            'tier': self.tier.value if isinstance(self.tier, ServiceTier) else self.tier,
+            'port': self.port,
+            'timestamp': self.timestamp,
+            'metadata': self.metadata,
         }
         return json.dumps(data)
 
     @classmethod
-    def from_json(cls, data: str | dict) -> "ServiceAnnouncement":
+    def from_json(cls, data: str | dict) -> 'ServiceAnnouncement':
         """Parse from JSON message."""
         if isinstance(data, str):
             data = json.loads(data)
         return cls(
-            slug=data["slug"],
-            name=data["name"],
-            url=data["url"],
-            health_check=data["health_check"],
-            tier=ServiceTier(data["tier"]),
-            port=data["port"],
-            timestamp=data.get("timestamp", datetime.utcnow().isoformat()),
-            metadata=data.get("metadata", {}),
+            slug=data['slug'],
+            name=data['name'],
+            url=data['url'],
+            health_check=data['health_check'],
+            tier=ServiceTier(data['tier']),
+            port=data['port'],
+            timestamp=data.get('timestamp', datetime.utcnow().isoformat()),
+            metadata=data.get('metadata', {}),
         )
 
 
@@ -124,7 +124,7 @@ class ServiceAnnouncer:
         Initialize the service announcer.
 
         Args:
-            slug: Unique service identifier (e.g., "hirag-v2")
+            slug: Unique service identifier (e.g., 'hirag-v2')
             name: Human-readable service name
             url: Full service URL
             port: Service port number
@@ -143,7 +143,7 @@ class ServiceAnnouncer:
         self.tier = tier
 
         self.health_check = health_check or f"{url.rstrip('/')}/healthz"
-        self.nats_url = nats_url or os.getenv("NATS_URL", "nats://nats:4222")
+        self.nats_url = nats_url or os.getenv('NATS_URL', 'nats://nats:4222')
         self.metadata = metadata or {}
 
     def create_announcement(self) -> ServiceAnnouncement:
@@ -181,7 +181,7 @@ class ServiceAnnouncer:
 
             return True
         except Exception as e:
-            print(f"Failed to announce service: {e}")
+            print(f'Failed to announce service: {e}')
             return False
 
     async def announce_with_retry(
@@ -233,12 +233,12 @@ async def announce_service(
 
     Example:
         await announce_service(
-            slug="hirag-v2",
-            name="Hi-RAG Gateway v2",
-            url="http://hi-rag-gateway-v2:8086",
+            slug='hirag-v2',
+            name='Hi-RAG Gateway v2',
+            url='http://hi-rag-gateway-v2:8086',
             port=8086,
-            tier="api",
-            metadata={"gpu_port": 8087}
+            tier='api',
+            metadata={'gpu_port': 8087}
         )
     """
     announcer = ServiceAnnouncer(
@@ -305,45 +305,45 @@ class BackgroundAnnouncer:
 
 
 # Example usage and testing
-if __name__ == "__main__":
+if __name__ == '__main__':
     async def main():
         """Example usage of service announcer."""
 
         # Example 1: Simple announcement
         await announce_service(
-            slug="example-service",
-            name="Example Service",
-            url="http://localhost:8080",
+            slug='example-service',
+            name='Example Service',
+            url='http://localhost:8080',
             port=8080,
-            tier="api",
+            tier='api',
         )
-        print("Service announced!")
+        print('Service announced!')
 
         # Example 2: With metadata
         await announce_service(
-            slug="hirag-v2",
-            name="Hi-RAG Gateway v2",
-            url="http://hi-rag-gateway-v2:8086",
+            slug='hirag-v2',
+            name='Hi-RAG Gateway v2',
+            url='http://hi-rag-gateway-v2:8086',
             port=8086,
-            tier="api",
+            tier='api',
             metadata={
-                "gpu_port": 8087,
-                "features": ["vector", "graph", "fulltext"],
-                "rerank_enabled": True,
+                'gpu_port': 8087,
+                'features': ['vector', 'graph', 'fulltext'],
+                'rerank_enabled': True,
             },
         )
 
         # Example 3: Background announcer
         announcer = ServiceAnnouncer(
-            slug="bg-service",
-            name="Background Service",
-            url="http://localhost:8081",
+            slug='bg-service',
+            name='Background Service',
+            url='http://localhost:8081',
             port=8081,
-            tier="worker",
+            tier='worker',
         )
         bg = BackgroundAnnouncer(announcer, interval=30)
         await bg.start()
-        print("Background announcer started (30s interval)")
+        print('Background announcer started (30s interval)')
 
         # Keep running...
         await asyncio.sleep(10)
