@@ -396,6 +396,7 @@ try:
     from .youtube_control import (
         YouTubeControlError,
         create_playlist,
+        delete_comment,
         delete_playlist,
         delete_playlist_item,
         insert_comment,
@@ -408,6 +409,7 @@ except ImportError:  # pragma: no cover
     from youtube_control import (  # type: ignore
         YouTubeControlError,
         create_playlist,
+        delete_comment,
         delete_playlist,
         delete_playlist_item,
         insert_comment,
@@ -1025,6 +1027,12 @@ class CommentCreateRequest(YouTubeControlRequest):
     parent_comment_id: str | None = Field(None, description='Parent comment ID when creating a reply')
 
 
+class CommentDeleteRequest(YouTubeControlRequest):
+    comment_id: str = Field(..., description='Target YouTube comment ID to delete')
+    video_id: str | None = Field(None, description='Optional video ID for audit context')
+    parent_comment_id: str | None = Field(None, description='Optional parent comment ID for reply deletion context')
+
+
 def _control_plane_status() -> dict[str, Any]:
     return {
         'google_client_configured': bool(YT_GOOGLE_CLIENT_ID and YT_GOOGLE_CLIENT_SECRET),
@@ -1039,6 +1047,7 @@ def _control_plane_status() -> dict[str, Any]:
             'playlist_remove',
             'playlist_reorder',
             'comment_create',
+            'comment_delete',
         ],
     }
 
@@ -1203,6 +1212,18 @@ def _execute_comment_create(body: CommentCreateRequest) -> dict[str, Any]:
         video_id=body.video_id,
         text=body.text,
         parent_comment_id=body.parent_comment_id,
+    )
+
+
+def _execute_comment_delete(body: CommentDeleteRequest) -> dict[str, Any]:
+    access_token = refresh_access_token(
+        client_id=YT_GOOGLE_CLIENT_ID,
+        client_secret=YT_GOOGLE_CLIENT_SECRET,
+        refresh_token=_resolve_control_refresh_token(body.refresh_token),
+    )
+    return delete_comment(
+        access_token=access_token,
+        comment_id=body.comment_id,
     )
 
 
@@ -3719,6 +3740,59 @@ async def yt_control_comment(
     _record_control_action(
         action_id=preview['action_id'],
         action='comment_create',
+        status='executed',
+        body=body,
+        details=preview['details'],
+        result=result,
+    )
+    _publish_event('creator.youtube.control.executed.v1', payload)
+    return {'status': 'executed', **payload}
+
+
+@app.post('/yt/control/comment/delete')
+async def yt_control_comment_delete(
+    body: CommentDeleteRequest,
+    _: None = Depends(require_control_plane_access),
+) -> dict[str, Any]:
+    """Preview or execute deleting a YouTube comment or reply via YouTube Data API."""
+    _ensure_control_execute_allowed(body.execute, body.approved_by)
+    preview = _control_preview(
+        'comment_delete',
+        body,
+        {
+            'comment_id': body.comment_id,
+            'video_id': body.video_id,
+            'parent_comment_id': body.parent_comment_id,
+        },
+    )
+    if not body.execute:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='comment_delete',
+            status='preview',
+            body=body,
+            details=preview['details'],
+        )
+        return {'status': 'preview', **preview}
+    try:
+        result = await asyncio.to_thread(_execute_comment_delete, body)
+    except YouTubeControlError as exc:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='comment_delete',
+            status='error',
+            body=body,
+            details=preview['details'],
+            error=str(exc),
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    payload = {
+        **preview,
+        'result': result,
+    }
+    _record_control_action(
+        action_id=preview['action_id'],
+        action='comment_delete',
         status='executed',
         body=body,
         details=preview['details'],

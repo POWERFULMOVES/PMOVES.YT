@@ -236,3 +236,19 @@ def insert_comment(
         timeout=30,
     )
     return _check_response(response, 'insert_comment')
+
+
+def delete_comment(
+    *,
+    access_token: str,
+    comment_id: str,
+) -> dict[str, Any]:
+    response = requests.delete(
+        f'{YOUTUBE_API_BASE}/comments',
+        params={'id': comment_id},
+        headers={'Authorization': f'Bearer {access_token}'},
+        timeout=30,
+    )
+    if response.status_code >= 400:
+        _check_response(response, 'delete_comment')
+    return {'id': comment_id, 'deleted': True}
