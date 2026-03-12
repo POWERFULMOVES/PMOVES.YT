@@ -40,7 +40,7 @@ YouTube ingest helper that emits CHIT geometry after analysis.
   - companion/Invidious for fallback download paths
   - Supabase + NATS + Jellyfin handoff for downstream PMOVES workflows
 - PMOVES.YT is not yet the owned-channel write/control plane:
-  - playlist mutation
+  - full playlist/channel lifecycle management
   - comment/reply actions
   - broader YouTube channel management
 - Those creator-control actions should be implemented through the YouTube Data API with separate
@@ -53,6 +53,8 @@ YouTube ingest helper that emits CHIT geometry after analysis.
   - reports whether Google client credentials, a default refresh token, and approval gating are configured
 - `POST /yt/control/playlist/add`
   - preview or execute adding a video to a playlist
+- `POST /yt/control/playlist/create`
+  - preview or execute creating a playlist
 - `POST /yt/control/playlist/remove`
   - preview or execute removing an item from a playlist
 - `POST /yt/control/playlist/reorder`

@@ -28,6 +28,33 @@ def test_playlist_add_returns_preview_by_default(monkeypatch):
     assert audits[0]['action'] == 'playlist_add'
 
 
+def test_playlist_create_returns_preview_by_default(monkeypatch):
+    events = []
+    audits = []
+    monkeypatch.setattr(app_module, '_publish_event', lambda topic, payload: events.append((topic, payload)))
+    monkeypatch.setattr(app_module, '_record_control_action', lambda **kwargs: audits.append(kwargs))
+
+    client = TestClient(app_module.app)
+    resp = client.post(
+        '/yt/control/playlist/create',
+        json={
+            'title': 'PMOVES Creator Queue',
+            'description': 'Owned channel review queue',
+            'privacy_status': 'unlisted',
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data['status'] == 'preview'
+    assert data['action'] == 'playlist_create'
+    assert data['details']['title'] == 'PMOVES Creator Queue'
+    assert data['details']['privacy_status'] == 'unlisted'
+    assert events[0][0] == 'creator.youtube.control.preview.v1'
+    assert audits[0]['status'] == 'preview'
+    assert audits[0]['action'] == 'playlist_create'
+
+
 def test_playlist_add_execute_requires_approval(monkeypatch):
     monkeypatch.setattr(app_module, 'YT_CONTROL_REQUIRE_APPROVAL', True)
 
@@ -43,6 +70,44 @@ def test_playlist_add_execute_requires_approval(monkeypatch):
 
     assert resp.status_code == 400
     assert resp.json()['detail'] == 'approved_by is required when execute=true'
+
+
+def test_playlist_create_execute_uses_youtube_control_runtime(monkeypatch):
+    events = []
+    audits = []
+    monkeypatch.setattr(app_module, '_publish_event', lambda topic, payload: events.append((topic, payload)))
+    monkeypatch.setattr(app_module, '_record_control_action', lambda **kwargs: audits.append(kwargs))
+    monkeypatch.setattr(app_module, 'YT_GOOGLE_CLIENT_ID', 'client-id')
+    monkeypatch.setattr(app_module, 'YT_GOOGLE_CLIENT_SECRET', 'client-secret')
+    monkeypatch.setattr(app_module, 'YT_GOOGLE_REFRESH_TOKEN', 'refresh-token')
+    monkeypatch.setattr(app_module, 'YT_CONTROL_REQUIRE_APPROVAL', True)
+    monkeypatch.setattr(app_module, 'refresh_access_token', lambda **kwargs: 'access-token')
+    monkeypatch.setattr(
+        app_module,
+        'create_playlist',
+        lambda **kwargs: {'id': 'PLNEW123', 'snippet': {'title': kwargs['title']}, 'status': {'privacyStatus': kwargs['privacy_status']}},
+    )
+
+    client = TestClient(app_module.app)
+    resp = client.post(
+        '/yt/control/playlist/create',
+        json={
+            'title': 'PMOVES Creator Queue',
+            'description': 'Owned channel review queue',
+            'privacy_status': 'private',
+            'execute': True,
+            'approved_by': 'discord-agent',
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data['status'] == 'executed'
+    assert data['action'] == 'playlist_create'
+    assert data['result']['id'] == 'PLNEW123'
+    assert events[0][0] == 'creator.youtube.control.executed.v1'
+    assert audits[0]['status'] == 'executed'
+    assert audits[0]['action'] == 'playlist_create'
 
 
 def test_playlist_remove_returns_preview_by_default(monkeypatch):

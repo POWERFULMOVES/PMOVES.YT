@@ -74,6 +74,34 @@ def insert_playlist_item(
     return _check_response(response, 'insert_playlist_item')
 
 
+def create_playlist(
+    *,
+    access_token: str,
+    title: str,
+    description: str | None = None,
+    privacy_status: str = 'private',
+    default_language: str | None = None,
+) -> dict[str, Any]:
+    snippet: dict[str, Any] = {
+        'title': title,
+    }
+    if description:
+        snippet['description'] = description
+    if default_language:
+        snippet['defaultLanguage'] = default_language
+    response = requests.post(
+        f'{YOUTUBE_API_BASE}/playlists',
+        params={'part': 'snippet,status'},
+        headers={'Authorization': f'Bearer {access_token}'},
+        json={
+            'snippet': snippet,
+            'status': {'privacyStatus': privacy_status},
+        },
+        timeout=30,
+    )
+    return _check_response(response, 'create_playlist')
+
+
 def delete_playlist_item(
     *,
     access_token: str,

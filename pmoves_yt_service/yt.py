@@ -395,6 +395,7 @@ except ImportError:  # pragma: no cover
 try:
     from .youtube_control import (
         YouTubeControlError,
+        create_playlist,
         delete_playlist_item,
         insert_comment,
         insert_playlist_item,
@@ -404,6 +405,7 @@ try:
 except ImportError:  # pragma: no cover
     from youtube_control import (  # type: ignore
         YouTubeControlError,
+        create_playlist,
         delete_playlist_item,
         insert_comment,
         insert_playlist_item,
@@ -981,6 +983,13 @@ class PlaylistItemAddRequest(YouTubeControlRequest):
     position: int | None = Field(None, description='Optional target position inside the playlist')
 
 
+class PlaylistCreateRequest(YouTubeControlRequest):
+    title: str = Field(..., min_length=1, description='Title for the new YouTube playlist')
+    description: str | None = Field(None, description='Optional playlist description')
+    privacy_status: str = Field('private', description='Playlist privacy status')
+    default_language: str | None = Field(None, description='Optional default language code')
+
+
 class PlaylistItemRemoveRequest(YouTubeControlRequest):
     playlist_item_id: str = Field(..., description='Playlist item ID to remove')
     playlist_id: str | None = Field(None, description='Optional playlist ID for audit context')
@@ -1007,6 +1016,7 @@ def _control_plane_status() -> dict[str, Any]:
         'approval_required': YT_CONTROL_REQUIRE_APPROVAL,
         'audit_table': 'pmoves_core.youtube_control_actions',
         'supported_actions': [
+            'playlist_create',
             'playlist_add',
             'playlist_remove',
             'playlist_reorder',
@@ -1091,6 +1101,21 @@ def _execute_playlist_add(body: PlaylistItemAddRequest) -> dict[str, Any]:
         playlist_id=body.playlist_id,
         video_id=body.video_id,
         position=body.position,
+    )
+
+
+def _execute_playlist_create(body: PlaylistCreateRequest) -> dict[str, Any]:
+    access_token = refresh_access_token(
+        client_id=YT_GOOGLE_CLIENT_ID,
+        client_secret=YT_GOOGLE_CLIENT_SECRET,
+        refresh_token=_resolve_control_refresh_token(body.refresh_token),
+    )
+    return create_playlist(
+        access_token=access_token,
+        title=body.title,
+        description=body.description,
+        privacy_status=body.privacy_status,
+        default_language=body.default_language,
     )
 
 
@@ -3326,6 +3351,60 @@ async def yt_control_playlist_add(
     _record_control_action(
         action_id=preview['action_id'],
         action='playlist_add',
+        status='executed',
+        body=body,
+        details=preview['details'],
+        result=result,
+    )
+    _publish_event('creator.youtube.control.executed.v1', payload)
+    return {'status': 'executed', **payload}
+
+
+@app.post('/yt/control/playlist/create')
+async def yt_control_playlist_create(
+    body: PlaylistCreateRequest,
+    _: None = Depends(require_control_plane_access),
+) -> dict[str, Any]:
+    """Preview or execute creating an owned playlist via YouTube Data API."""
+    _ensure_control_execute_allowed(body.execute, body.approved_by)
+    preview = _control_preview(
+        'playlist_create',
+        body,
+        {
+            'title': body.title,
+            'description_preview': body.description[:160] if isinstance(body.description, str) else None,
+            'privacy_status': body.privacy_status,
+            'default_language': body.default_language,
+        },
+    )
+    if not body.execute:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='playlist_create',
+            status='preview',
+            body=body,
+            details=preview['details'],
+        )
+        return {'status': 'preview', **preview}
+    try:
+        result = await asyncio.to_thread(_execute_playlist_create, body)
+    except YouTubeControlError as exc:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='playlist_create',
+            status='error',
+            body=body,
+            details=preview['details'],
+            error=str(exc),
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    payload = {
+        **preview,
+        'result': result,
+    }
+    _record_control_action(
+        action_id=preview['action_id'],
+        action='playlist_create',
         status='executed',
         body=body,
         details=preview['details'],
