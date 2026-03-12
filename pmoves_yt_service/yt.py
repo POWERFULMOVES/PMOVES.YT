@@ -57,12 +57,22 @@ API Endpoints:
     POST /yt_search: Search ingested content
 """
 
-import os, json, tempfile, shutil, asyncio, time, re, math, uuid, copy, logging, threading
+import os
+import json
+import shutil
+import asyncio
+import time
+import re
+import math
+import uuid
+import copy
+import logging
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
+from typing import Any
 from fastapi import FastAPI, Body, HTTPException, BackgroundTasks, Depends, Header, Response
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 try:
     import yt_dlp
     from yt_dlp.utils import DownloadError, PostProcessingError
@@ -103,15 +113,15 @@ except Exception:  # pragma: no cover - fallback when tenacity is unavailable
             self.retry_state = _FallbackRetryState(attempt_number)
 
     class _FallbackLastAttempt:
-        def __init__(self, exc: Optional[BaseException] = None):
+        def __init__(self, exc: BaseException | None = None):
             self._exc = exc
 
-        def exception(self) -> Optional[BaseException]:
+        def exception(self) -> BaseException | None:
             return self._exc
 
     class RetryError(Exception):
-        def __init__(self, last_attempt: Optional[_FallbackLastAttempt] = None):
-            super().__init__("retry failed")
+        def __init__(self, last_attempt: _FallbackLastAttempt | None = None):
+            super().__init__('retry failed')
             self.last_attempt = last_attempt or _FallbackLastAttempt()
 
     class AsyncRetrying:
@@ -141,19 +151,23 @@ except Exception:  # pragma: no cover - fallback when tenacity is unavailable
 try:
     from services.common.events import envelope  # type: ignore
 except Exception:
-    import uuid, datetime
-    def envelope(topic: str, payload: dict, correlation_id: str|None=None, parent_id: str|None=None, source: str="pmoves-yt"):
-        # Minimal schema-free envelope for environments where shared modules aren’t available
+    import uuid
+    import datetime
+
+    def envelope(topic: str, payload: dict, correlation_id: str | None = None, parent_id: str | None = None, source: str = 'pmoves-yt'):
+        # Minimal schema-free envelope for environments where shared modules are not available
         env = {
-            "id": str(uuid.uuid4()),
-            "topic": topic,
-            "ts": datetime.datetime.now(timezone.utc).isoformat() + "Z",
-            "version": "v1",
-            "source": source,
-            "payload": payload,
+            'id': str(uuid.uuid4()),
+            'topic': topic,
+            'ts': datetime.datetime.now(timezone.utc).isoformat() + 'Z',
+            'version': 'v1',
+            'source': source,
+            'payload': payload,
         }
-        if correlation_id: env["correlation_id"] = correlation_id
-        if parent_id: env["parent_id"] = parent_id
+        if correlation_id:
+            env['correlation_id'] = correlation_id
+        if parent_id:
+            env['parent_id'] = parent_id
         return env
 
 try:
@@ -174,7 +188,7 @@ except ImportError:
 
     def get_service_url_sync(slug: str, *, default_port: int = 80) -> str:
         """Fallback when service registry is not available."""
-        return f"http://{slug}:{default_port}"
+        return f'http://{slug}:{default_port}'
 
 
 def _resolve_service_url(
@@ -205,6 +219,7 @@ def _resolve_service_url(
     if SERVICE_REGISTRY_AVAILABLE:
         return get_service_url_sync(service_slug, default_port=default_port)
     return docker_fallback
+
 
 # Prometheus metrics
 from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
@@ -241,69 +256,79 @@ nats_messages_total = Counter(
     registry=PROM_REGISTRY,
 )
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan."""
-    global _nc, _nc_connect_task
+    global _nc, _nc_connect_task, _periodic_docs_task
     # Startup
     # Non-blocking, quiet NATS init. Skip entirely unless explicitly enabled.
     if not YT_NATS_ENABLE or not NATS_URL:
         _nc = None
     else:
         if _nc_connect_task is None or _nc_connect_task.done():
-            _nc_connect_task = asyncio.create_task(_nats_connect_loop(), name="pmoves-yt-nats-connect")
+            _nc_connect_task = _track_background_task(
+                asyncio.create_task(_nats_connect_loop(), name='pmoves-yt-nats-connect'),
+            )
 
     # Docs sync at startup + optional periodic schedule
     try:
         if collect_yt_dlp_docs and sync_to_supabase:
-            if os.environ.get("YT_DOCS_SYNC_ON_START", "true").lower() in {"1","true","yes","y"}:
+            if os.environ.get('YT_DOCS_SYNC_ON_START', 'true').lower() in {'1', 'true', 'yes', 'y'}:
                 try:
                     docs = collect_yt_dlp_docs()
                     sync_to_supabase(docs)
-                    logger.info("yt-dlp docs synced on start")
+                    logger.info('yt-dlp docs synced on start')
                 except Exception as exc:
-                    logger.warning("docs sync on start failed: %s", exc)
-            interval_env = os.environ.get("YT_DOCS_SYNC_INTERVAL_SECONDS") or os.environ.get("YT_DOCS_SYNC_INTERVAL")
+                    logger.warning('docs sync on start failed: %s', exc)
+            interval_env = os.environ.get('YT_DOCS_SYNC_INTERVAL_SECONDS') or os.environ.get('YT_DOCS_SYNC_INTERVAL')
             if interval_env:
                 try:
                     interval = int(interval_env)
                 except Exception:
                     interval = 86400
+
                 async def _periodic_docs_sync():
                     while True:
                         await asyncio.sleep(interval)
                         try:
                             docs = collect_yt_dlp_docs()
                             sync_to_supabase(docs)
-                            logger.info("yt-dlp docs synced (periodic)")
+                            logger.info('yt-dlp docs synced (periodic)')
                         except Exception as exc:
-                            logger.warning("periodic docs sync failed: %s", exc)
-                asyncio.create_task(_periodic_docs_sync(), name="pmoves-yt-docs-sync")
+                            logger.warning('periodic docs sync failed: %s', exc)
+                _periodic_docs_task = _track_background_task(
+                    asyncio.create_task(_periodic_docs_sync(), name='pmoves-yt-docs-sync'),
+                )
     except Exception:
         pass
     yield
     # Shutdown
+    if _periodic_docs_task is not None:
+        _periodic_docs_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _periodic_docs_task
+        _periodic_docs_task = None
+
     if _nc_connect_task is not None:
         _nc_connect_task.cancel()
-        try:
+        with suppress(asyncio.CancelledError):
             await _nc_connect_task
-        except asyncio.CancelledError:
-            pass
         _nc_connect_task = None
 
-    if _nc is not None and not getattr(_nc, "is_closed", True):
+    if _nc is not None and not getattr(_nc, 'is_closed', True):
         try:
             await _nc.close()
         except Exception as err:
-            logger.debug("Error closing NATS client during shutdown: %s", err)
+            logger.debug('Error closing NATS client during shutdown: %s', err)
     _nc = None
 
-app = FastAPI(title="PMOVES.YT", version="1.0.0", lifespan=lifespan)
-logger = logging.getLogger("pmoves-yt")
+app = FastAPI(title='PMOVES.YT', version='1.0.0', lifespan=lifespan)
+logger = logging.getLogger('pmoves-yt')
 logger.setLevel(logging.INFO)
 if not logger.handlers:
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    handler.setFormatter(logging.Formatter('%(levelname)s:%(name)s:%(message)s'))
     logger.addHandler(handler)
 logger.propagate = True
 
@@ -353,24 +378,27 @@ async def require_docs_sync_access(x_api_key: str | None = Header(default=None, 
 try:
     from .docs_sync import collect_yt_dlp_docs, sync_to_supabase  # type: ignore
 except ImportError:  # pragma: no cover
-    logger.debug("docs_sync: package-local import failed, trying PMOVES.AI compatibility shim")
+    logger.debug('docs_sync: package-local import failed, trying PMOVES.AI compatibility shim')
     try:
         from pmoves.services.pmoves_yt.docs_sync import collect_yt_dlp_docs, sync_to_supabase  # type: ignore
     except ImportError:
-        logger.debug("docs_sync: not available — docs sync disabled")
+        logger.debug('docs_sync: not available — docs sync disabled')
         collect_yt_dlp_docs = None  # type: ignore
         sync_to_supabase = None  # type: ignore
 try:
     from .docs_catalog import options_catalog, extractor_count, version_info  # type: ignore
 except Exception:  # pragma: no cover
     def options_catalog():  # type: ignore
-        return {"options": [], "counts": {"options": 0}}
+        return {'options': [], 'counts': {'options': 0}}
+
     def extractor_count():  # type: ignore
         return 0
-    def version_info():  # type: ignore
-        return {"yt_dlp_version": "unknown"}
 
-def _parse_bool(value: Optional[str]) -> Optional[bool]:
+    def version_info():  # type: ignore
+        return {'yt_dlp_version': 'unknown'}
+
+
+def _parse_bool(value: str | None) -> bool | None:
     """Parse a string value into a boolean.
 
     Converts common string representations of boolean values into actual booleans.
@@ -386,20 +414,20 @@ def _parse_bool(value: Optional[str]) -> Optional[bool]:
     if value is None:
         return None
     lowered = value.strip().lower()
-    if lowered in {"1", "true", "yes", "on"}:
+    if lowered in {'1', 'true', 'yes', 'on'}:
         return True
-    if lowered in {"0", "false", "no", "off"}:
+    if lowered in {'0', 'false', 'no', 'off'}:
         return False
     return None
 
 
-def _parse_csv_env_list(value: Optional[str], *, default: list[str]) -> list[str]:
+def _parse_csv_env_list(value: str | None, *, default: list[str]) -> list[str]:
     """Parse a comma-delimited env var into a de-duplicated ordered list."""
     if not value or not value.strip():
         return list(default)
     seen: set[str] = set()
     out: list[str] = []
-    for item in value.split(","):
+    for item in value.split(','):
         cleaned = item.strip()
         if not cleaned or cleaned in seen:
             continue
@@ -407,160 +435,169 @@ def _parse_csv_env_list(value: Optional[str], *, default: list[str]) -> list[str
         out.append(cleaned)
     return out or list(default)
 
-MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT") or os.environ.get("S3_ENDPOINT") or "minio:9000"
-MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY") or os.environ.get("AWS_ACCESS_KEY_ID", "")
-MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-MINIO_SECURE = (os.environ.get("MINIO_SECURE","false").lower() == "true")
-DEFAULT_BUCKET = os.environ.get("YT_BUCKET","assets")
-DEFAULT_NAMESPACE = os.environ.get("INDEXER_NAMESPACE","pmoves")
+
+MINIO_ENDPOINT = os.environ.get('MINIO_ENDPOINT') or os.environ.get('S3_ENDPOINT') or 'minio:9000'
+MINIO_ACCESS_KEY = os.environ.get('MINIO_ACCESS_KEY') or os.environ.get('AWS_ACCESS_KEY_ID', '')
+MINIO_SECRET_KEY = os.environ.get('MINIO_SECRET_KEY') or os.environ.get('AWS_SECRET_ACCESS_KEY', '')
+MINIO_SECURE = (os.environ.get('MINIO_SECURE', 'false').lower() == 'true')
+DEFAULT_BUCKET = os.environ.get('YT_BUCKET', 'assets')
+DEFAULT_NAMESPACE = os.environ.get('INDEXER_NAMESPACE', 'pmoves')
 # Prefer unified Supabase REST; fall back to legacy compose PostgREST only if neither is present
 SUPA = (
-    os.environ.get("SUPABASE_REST_URL")
-    or os.environ.get("SUPA_REST_URL")
-    or "http://postgrest:3000"
+    os.environ.get('SUPABASE_REST_URL')
+    or os.environ.get('SUPA_REST_URL')
+    or 'http://postgrest:3000'
 )
 SUPA_SERVICE_KEY = (
-    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    or os.environ.get("SUPABASE_SERVICE_KEY")
-    or os.environ.get("SUPABASE_KEY")
-    or os.environ.get("SUPABASE_ANON_KEY")
+    os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
+    or os.environ.get('SUPABASE_SERVICE_KEY')
+    or os.environ.get('SUPABASE_KEY')
+    or os.environ.get('SUPABASE_ANON_KEY')
 )
-NATS_URL = (os.environ.get("NATS_URL") or "").strip()
-YT_NATS_ENABLE = os.environ.get("YT_NATS_ENABLE", "false").lower() == "true"
-FFW_URL = _resolve_service_url("FFW_URL", "ffmpeg-whisper", 8078, "http://ffmpeg-whisper:8078")
-HIRAG_URL = _resolve_service_url("HIRAG_URL", "hirag-v2", 8086, "http://hi-rag-gateway-v2:8086")
-INVIDIOUS_BASE_URL = os.environ.get("INVIDIOUS_BASE_URL")
+NATS_URL = (os.environ.get('NATS_URL') or '').strip()
+YT_NATS_ENABLE = os.environ.get('YT_NATS_ENABLE', 'false').lower() == 'true'
+FFW_URL = _resolve_service_url('FFW_URL', 'ffmpeg-whisper', 8078, 'http://ffmpeg-whisper:8078')
+HIRAG_URL = _resolve_service_url('HIRAG_URL', 'hirag-v2', 8086, 'http://hi-rag-gateway-v2:8086')
+INVIDIOUS_BASE_URL = os.environ.get('INVIDIOUS_BASE_URL')
 
-CHANNEL_MONITOR_STATUS_URL = os.environ.get("CHANNEL_MONITOR_STATUS_URL")
-CHANNEL_MONITOR_STATUS_SECRET = os.environ.get("CHANNEL_MONITOR_STATUS_SECRET")
+CHANNEL_MONITOR_STATUS_URL = os.environ.get('CHANNEL_MONITOR_STATUS_URL')
+CHANNEL_MONITOR_STATUS_SECRET = os.environ.get('CHANNEL_MONITOR_STATUS_SECRET')
 
 # Summarization (Gemma) configuration
-YT_SUMMARY_PROVIDER = os.environ.get("YT_SUMMARY_PROVIDER", "ollama")  # ollama|hf
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-YT_GEMMA_MODEL = os.environ.get("YT_GEMMA_MODEL", "gemma2:9b-instruct")
-HF_GEMMA_MODEL = os.environ.get("HF_GEMMA_MODEL", "google/gemma-2-9b-it")
-HF_USE_GPU = os.environ.get("HF_USE_GPU", "false").lower() == "true"
-HF_TOKEN = os.environ.get("HF_TOKEN")
+YT_SUMMARY_PROVIDER = os.environ.get('YT_SUMMARY_PROVIDER', 'ollama')  # ollama|hf
+OLLAMA_URL = os.environ.get('OLLAMA_URL', 'http://localhost:11434')
+YT_GEMMA_MODEL = os.environ.get('YT_GEMMA_MODEL', 'gemma2:9b-instruct')
+HF_GEMMA_MODEL = os.environ.get('HF_GEMMA_MODEL', 'google/gemma-2-9b-it')
+HF_USE_GPU = os.environ.get('HF_USE_GPU', 'false').lower() == 'true'
+HF_TOKEN = os.environ.get('HF_TOKEN')
 
 # Playlist/Channel defaults
-YT_PLAYLIST_MAX = int(os.environ.get("YT_PLAYLIST_MAX", "50"))
-YT_CONCURRENCY = int(os.environ.get("YT_CONCURRENCY", "2"))
-YT_RATE_LIMIT = float(os.environ.get("YT_RATE_LIMIT", "0.0"))  # seconds between downloads
-YT_RETRY_MAX = int(os.environ.get("YT_RETRY_MAX", "3"))
-YT_TEMP_ROOT = Path(os.environ.get("YT_TEMP_ROOT", "/tmp/pmoves-yt"))
-YT_ARCHIVE_DIR = Path(os.environ.get("YT_ARCHIVE_DIR", "/data/yt-dlp"))
-YT_ENABLE_DOWNLOAD_ARCHIVE = os.environ.get("YT_ENABLE_DOWNLOAD_ARCHIVE", "true").lower() == "true"
-YT_DOWNLOAD_ARCHIVE = os.environ.get("YT_DOWNLOAD_ARCHIVE")
+YT_PLAYLIST_MAX = int(os.environ.get('YT_PLAYLIST_MAX', '50'))
+YT_CONCURRENCY = int(os.environ.get('YT_CONCURRENCY', '2'))
+YT_RATE_LIMIT = float(os.environ.get('YT_RATE_LIMIT', '0.0'))  # seconds between downloads
+YT_RETRY_MAX = int(os.environ.get('YT_RETRY_MAX', '3'))
+YT_TEMP_ROOT = Path(os.environ.get('YT_TEMP_ROOT', '/tmp/pmoves-yt'))
+YT_ARCHIVE_DIR = Path(os.environ.get('YT_ARCHIVE_DIR', '/data/yt-dlp'))
+YT_ENABLE_DOWNLOAD_ARCHIVE = os.environ.get('YT_ENABLE_DOWNLOAD_ARCHIVE', 'true').lower() == 'true'
+YT_DOWNLOAD_ARCHIVE = os.environ.get('YT_DOWNLOAD_ARCHIVE')
 if not YT_DOWNLOAD_ARCHIVE:
-    YT_DOWNLOAD_ARCHIVE = str(YT_ARCHIVE_DIR / "download-archive.txt")
+    YT_DOWNLOAD_ARCHIVE = str(YT_ARCHIVE_DIR / 'download-archive.txt')
 
-_subtitle_env = os.environ.get("YT_SUBTITLE_LANGS", "")
-YT_SUBTITLE_LANGS = [lang.strip() for lang in _subtitle_env.split(",") if lang.strip()]
-YT_SUBTITLE_AUTO = os.environ.get("YT_SUBTITLE_AUTO", "false").lower() == "true"
-YT_WRITE_INFO_JSON = os.environ.get("YT_WRITE_INFO_JSON", "true").lower() == "true"
+_subtitle_env = os.environ.get('YT_SUBTITLE_LANGS', '')
+YT_SUBTITLE_LANGS = [lang.strip() for lang in _subtitle_env.split(',') if lang.strip()]
+YT_SUBTITLE_AUTO = os.environ.get('YT_SUBTITLE_AUTO', 'false').lower() == 'true'
+YT_WRITE_INFO_JSON = os.environ.get('YT_WRITE_INFO_JSON', 'true').lower() == 'true'
 
-_postprocessors_env = os.environ.get("YT_POSTPROCESSORS_JSON")
-_postprocessors_default: List[Dict[str, Any]]
+_postprocessors_env = os.environ.get('YT_POSTPROCESSORS_JSON')
+_postprocessors_default: list[dict[str, Any]]
 if _postprocessors_env:
     try:
         parsed = json.loads(_postprocessors_env)
         if isinstance(parsed, list):
             _postprocessors_default = parsed
         else:
-            logger.warning("YT_POSTPROCESSORS_JSON must be a list; falling back to defaults")
+            logger.warning('YT_POSTPROCESSORS_JSON must be a list; falling back to defaults')
             _postprocessors_default = [
-                {"key": "FFmpegMetadata"},
-                {"key": "EmbedThumbnail"},
+                {'key': 'FFmpegMetadata'},
+                {'key': 'EmbedThumbnail'},
             ]
     except json.JSONDecodeError:
-        logger.warning("Failed to parse YT_POSTPROCESSORS_JSON; using defaults")
+        logger.warning('Failed to parse YT_POSTPROCESSORS_JSON; using defaults')
         _postprocessors_default = [
-            {"key": "FFmpegMetadata"},
-            {"key": "EmbedThumbnail"},
+            {'key': 'FFmpegMetadata'},
+            {'key': 'EmbedThumbnail'},
         ]
 else:
     _postprocessors_default = [
-        {"key": "FFmpegMetadata"},
-        {"key": "EmbedThumbnail"},
+        {'key': 'FFmpegMetadata'},
+        {'key': 'EmbedThumbnail'},
     ]
 
 # Segmentation thresholds (smart boundaries)
-YT_SEG_TARGET_DUR = float(os.environ.get("YT_SEG_TARGET_DUR", "30.0"))
-YT_SEG_GAP_THRESH = float(os.environ.get("YT_SEG_GAP_THRESH", "1.2"))
-YT_SEG_MIN_CHARS = int(os.environ.get("YT_SEG_MIN_CHARS", "600"))
-YT_SEG_MAX_CHARS = int(os.environ.get("YT_SEG_MAX_CHARS", "1500"))
-YT_SEG_MAX_DUR = float(os.environ.get("YT_SEG_MAX_DUR", "60.0"))
+YT_SEG_TARGET_DUR = float(os.environ.get('YT_SEG_TARGET_DUR', '30.0'))
+YT_SEG_GAP_THRESH = float(os.environ.get('YT_SEG_GAP_THRESH', '1.2'))
+YT_SEG_MIN_CHARS = int(os.environ.get('YT_SEG_MIN_CHARS', '600'))
+YT_SEG_MAX_CHARS = int(os.environ.get('YT_SEG_MAX_CHARS', '1500'))
+YT_SEG_MAX_DUR = float(os.environ.get('YT_SEG_MAX_DUR', '60.0'))
 # PO Token provider defaults
-BGUTIL_HTTP_BASE_URL = os.environ.get("BGUTIL_HTTP_BASE_URL")
-BGUTIL_DISABLE_INNERTUBE = os.environ.get("BGUTIL_DISABLE_INNERTUBE")
+BGUTIL_HTTP_BASE_URL = os.environ.get('BGUTIL_HTTP_BASE_URL')
+BGUTIL_DISABLE_INNERTUBE = os.environ.get('BGUTIL_DISABLE_INNERTUBE')
 # Always include lexical indexing on upsert (can be disabled)
-YT_INDEX_LEXICAL = os.environ.get("YT_INDEX_LEXICAL", "true").lower() == "true"
+YT_INDEX_LEXICAL = os.environ.get('YT_INDEX_LEXICAL', 'true').lower() == 'true'
 try:
-    YT_INDEX_LEXICAL_DISABLE_THRESHOLD = max(0, int(os.environ.get("YT_INDEX_LEXICAL_DISABLE_THRESHOLD", "0")))
+    YT_INDEX_LEXICAL_DISABLE_THRESHOLD = max(0, int(os.environ.get('YT_INDEX_LEXICAL_DISABLE_THRESHOLD', '0')))
 except ValueError:
     YT_INDEX_LEXICAL_DISABLE_THRESHOLD = 0
 
-YT_ASYNC_UPSERT_ENABLED = os.environ.get("YT_ASYNC_UPSERT_ENABLED", "true").lower() == "true"
+YT_ASYNC_UPSERT_ENABLED = os.environ.get('YT_ASYNC_UPSERT_ENABLED', 'true').lower() == 'true'
 try:
-    YT_ASYNC_UPSERT_MIN_CHUNKS = max(1, int(os.environ.get("YT_ASYNC_UPSERT_MIN_CHUNKS", "200")))
+    YT_ASYNC_UPSERT_MIN_CHUNKS = max(1, int(os.environ.get('YT_ASYNC_UPSERT_MIN_CHUNKS', '200')))
 except ValueError:
     YT_ASYNC_UPSERT_MIN_CHUNKS = 600
 
 # Auto-tune segmentation thresholds based on content profile
-YT_SEG_AUTOTUNE = os.environ.get("YT_SEG_AUTOTUNE", "true").lower() == "true"
+YT_SEG_AUTOTUNE = os.environ.get('YT_SEG_AUTOTUNE', 'true').lower() == 'true'
 
 YT_PLAYER_CLIENTS = _parse_csv_env_list(
-    os.environ.get("YT_PLAYER_CLIENT"),
-    default=["default", "mweb"],
+    os.environ.get('YT_PLAYER_CLIENT'),
+    default=['default', 'mweb'],
 )
-YT_USER_AGENT = (os.environ.get("YT_USER_AGENT") or "").strip()
-YT_FORCE_IPV4 = os.environ.get("YT_FORCE_IPV4", "true").lower() == "true"
+YT_USER_AGENT = (os.environ.get('YT_USER_AGENT') or '').strip()
+YT_FORCE_IPV4 = os.environ.get('YT_FORCE_IPV4', 'true').lower() == 'true'
 try:
-    YT_EXTRACTOR_RETRIES = int(os.environ.get("YT_EXTRACTOR_RETRIES", "2"))
+    YT_EXTRACTOR_RETRIES = int(os.environ.get('YT_EXTRACTOR_RETRIES', '2'))
 except ValueError:
     YT_EXTRACTOR_RETRIES = 2
-YT_COOKIES = os.environ.get("YT_COOKIES")
-INVIDIOUS_COMPANION_URL = os.environ.get("INVIDIOUS_COMPANION_URL")
-INVIDIOUS_COMPANION_KEY = os.environ.get("INVIDIOUS_COMPANION_KEY")
-INVIDIOUS_FALLBACK_FORMAT = os.environ.get("INVIDIOUS_FALLBACK_FORMAT", "video/mp4")
-YT_ENABLE_PO_TOKEN = os.environ.get("YT_ENABLE_PO_TOKEN", "false").lower() == "true"
-YT_COMPANION_ENABLED = os.environ.get("YT_COMPANION_ENABLED", "true").lower() in {"true", "1", "yes", "y"}
-YT_PO_TOKEN_VALUE = os.environ.get("YT_PO_TOKEN_VALUE")
-YT_PO_TOKEN_CONTEXT = (os.environ.get("YT_PO_TOKEN_CONTEXT") or "").strip()
-YT_PO_TOKEN_ITAG = os.environ.get("YT_PO_TOKEN_ITAG", "18")
+YT_COOKIES = os.environ.get('YT_COOKIES')
+INVIDIOUS_COMPANION_URL = os.environ.get('INVIDIOUS_COMPANION_URL')
+INVIDIOUS_COMPANION_KEY = os.environ.get('INVIDIOUS_COMPANION_KEY')
+INVIDIOUS_FALLBACK_FORMAT = os.environ.get('INVIDIOUS_FALLBACK_FORMAT', 'video/mp4')
+YT_ENABLE_PO_TOKEN = os.environ.get('YT_ENABLE_PO_TOKEN', 'false').lower() == 'true'
+YT_COMPANION_ENABLED = os.environ.get('YT_COMPANION_ENABLED', 'true').lower() in {'true', '1', 'yes', 'y'}
+YT_PO_TOKEN_VALUE = os.environ.get('YT_PO_TOKEN_VALUE')
+YT_PO_TOKEN_CONTEXT = (os.environ.get('YT_PO_TOKEN_CONTEXT') or '').strip()
+YT_PO_TOKEN_ITAG = os.environ.get('YT_PO_TOKEN_ITAG', '18')
 try:
-    YT_UPSERT_BATCH_SIZE = max(1, int(os.environ.get("YT_UPSERT_BATCH_SIZE", "200")))
+    YT_UPSERT_BATCH_SIZE = max(1, int(os.environ.get('YT_UPSERT_BATCH_SIZE', '200')))
 except ValueError:
     YT_UPSERT_BATCH_SIZE = 200
-SOUNDCLOUD_USERNAME = os.environ.get("SOUNDCLOUD_USERNAME")
-SOUNDCLOUD_PASSWORD = os.environ.get("SOUNDCLOUD_PASSWORD") or os.environ.get("SOUNDCLOUD_PASS")
-SOUNDCLOUD_COOKIEFILE = os.environ.get("SOUNDCLOUD_COOKIEFILE") or os.environ.get("SOUNDCLOUD_COOKIES")
-SOUNDCLOUD_COOKIES_FROM_BROWSER = os.environ.get("SOUNDCLOUD_COOKIES_FROM_BROWSER")
-YT_TRANSCRIPT_PROVIDER = os.environ.get("YT_TRANSCRIPT_PROVIDER") or "faster-whisper"
-YT_WHISPER_MODEL = os.environ.get("YT_WHISPER_MODEL") or "small"
-_raw_transcript_diarize = os.environ.get("YT_TRANSCRIPT_DIARIZE")
+SOUNDCLOUD_USERNAME = os.environ.get('SOUNDCLOUD_USERNAME')
+SOUNDCLOUD_PASSWORD = os.environ.get('SOUNDCLOUD_PASSWORD') or os.environ.get('SOUNDCLOUD_PASS')
+SOUNDCLOUD_COOKIEFILE = os.environ.get('SOUNDCLOUD_COOKIEFILE') or os.environ.get('SOUNDCLOUD_COOKIES')
+SOUNDCLOUD_COOKIES_FROM_BROWSER = os.environ.get('SOUNDCLOUD_COOKIES_FROM_BROWSER')
+YT_TRANSCRIPT_PROVIDER = os.environ.get('YT_TRANSCRIPT_PROVIDER') or 'faster-whisper'
+YT_WHISPER_MODEL = os.environ.get('YT_WHISPER_MODEL') or 'small'
+_raw_transcript_diarize = os.environ.get('YT_TRANSCRIPT_DIARIZE')
 if _raw_transcript_diarize is None:
     YT_TRANSCRIPT_DIARIZE = False
 else:
     parsed = _parse_bool(_raw_transcript_diarize)
     YT_TRANSCRIPT_DIARIZE = False if parsed is None else parsed
 
-_nc: Optional[NATS] = None
-_nc_connect_task: Optional[asyncio.Task] = None
-_periodic_docs_task: Optional[asyncio.Task] = None
+_nc: NATS | None = None
+_nc_connect_task: asyncio.Task | None = None
+_periodic_docs_task: asyncio.Task | None = None
 
-_emit_jobs: Dict[str, Dict[str, Any]] = {}
+_emit_jobs: dict[str, dict[str, Any]] = {}
 _emit_job_lock = threading.Lock()
+_background_tasks: set[asyncio.Task[Any]] = set()
 
 
-def _youtube_dl(ydl_opts: Dict[str, Any]):
+def _track_background_task(task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+    """Keep references to background tasks until they complete."""
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+def _youtube_dl(ydl_opts: dict[str, Any]):
     """Return a YoutubeDL client or fail with a clear runtime error."""
     if yt_dlp is None:
-        raise HTTPException(503, "yt_dlp is not installed in this runtime")
+        raise HTTPException(503, 'yt_dlp is not installed in this runtime')
     return yt_dlp.YoutubeDL(ydl_opts)
 
 
-def _record_emit_job(job_id: str, state: Dict[str, Any]) -> None:
+def _record_emit_job(job_id: str, state: dict[str, Any]) -> None:
     """Record or create an async emit job state.
 
     Thread-safe function to store the state of a Geometry Bus emit job.
@@ -589,7 +626,7 @@ def _update_emit_job(job_id: str, **updates: Any) -> None:
         _emit_jobs[job_id] = current
 
 
-def _get_emit_job(job_id: str) -> Dict[str, Any]:
+def _get_emit_job(job_id: str) -> dict[str, Any]:
     """Retrieve the current state of an emit job.
 
     Thread-safe function that returns a deep copy of the job state to prevent
@@ -624,11 +661,11 @@ def _utc_now() -> str:
 
 
 def _channel_monitor_notify(
-    video_id: Optional[str],
+    video_id: str | None,
     status: str,
     *,
-    error: Optional[str] = None,
-    metadata: Optional[Dict[str, Any]] = None,
+    error: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     """Notify the Channel Monitor service about video processing status.
 
@@ -643,14 +680,14 @@ def _channel_monitor_notify(
     """
     if not video_id or not CHANNEL_MONITOR_STATUS_URL:
         return
-    payload: Dict[str, Any] = {"video_id": video_id, "status": status}
+    payload: dict[str, Any] = {'video_id': video_id, 'status': status}
     if error:
-        payload["error"] = error
+        payload['error'] = error
     if metadata:
-        payload["metadata"] = metadata
-    headers = {"content-type": "application/json"}
+        payload['metadata'] = metadata
+    headers = {'content-type': 'application/json'}
     if CHANNEL_MONITOR_STATUS_SECRET:
-        headers["X-Channel-Monitor-Token"] = CHANNEL_MONITOR_STATUS_SECRET
+        headers['X-Channel-Monitor-Token'] = CHANNEL_MONITOR_STATUS_SECRET
     try:
         requests.post(
             CHANNEL_MONITOR_STATUS_URL,
@@ -659,9 +696,10 @@ def _channel_monitor_notify(
             timeout=5,
         )
     except requests.RequestException as exc:  # pragma: no cover - best effort
-        logger.warning("Channel monitor notify failed for %s: %s", video_id, exc)
+        logger.warning('Channel monitor notify failed for %s: %s', video_id, exc)
 
-def _with_ytdlp_defaults(opts: Dict[str, Any], *, po_token: Optional[str] = None) -> Dict[str, Any]:
+
+def _with_ytdlp_defaults(opts: dict[str, Any], *, po_token: str | None = None) -> dict[str, Any]:
     """Add hardened yt-dlp defaults for reliable YouTube downloads.
 
     Merges user-provided options with production-tested defaults that enable
@@ -693,7 +731,7 @@ def _with_ytdlp_defaults(opts: Dict[str, Any], *, po_token: Optional[str] = None
         effective_po_token = _normalize_po_token(effective_po_token, client_candidates)
         po_token_values = list(youtube_args.get('po_token') or [])
         if effective_po_token not in po_token_values:
-            youtube_args['po_token'] = [effective_po_token] + po_token_values
+            youtube_args['po_token'] = [effective_po_token, *po_token_values]
     if client_candidates:
         youtube_args['player_client'] = client_candidates
     if youtube_args:
@@ -730,33 +768,34 @@ def _with_ytdlp_defaults(opts: Dict[str, Any], *, po_token: Optional[str] = None
     return merged
 
 
-def _infer_po_token_context(player_clients: List[str]) -> str:
+def _infer_po_token_context(player_clients: list[str]) -> str:
     """Infer the most relevant yt-dlp PO token context from configured clients."""
     if YT_PO_TOKEN_CONTEXT:
         return YT_PO_TOKEN_CONTEXT
     for client in player_clients:
         normalized = client.strip()
-        if not normalized or normalized.startswith("-") or normalized == "default":
+        if not normalized or normalized.startswith('-') or normalized == 'default':
             continue
-        return f"{normalized}.gvs"
-    return "mweb.gvs"
+        return f'{normalized}.gvs'
+    return 'mweb.gvs'
 
 
-def _normalize_po_token(token: str, player_clients: List[str]) -> str:
+def _normalize_po_token(token: str, player_clients: list[str]) -> str:
     """Return PO tokens in yt-dlp's CLIENT.CONTEXT+TOKEN format."""
     raw = token.strip()
     if not raw:
         return raw
-    if "+" not in raw:
-        return f"{_infer_po_token_context(player_clients)}+{raw}"
-    prefix, suffix = raw.split("+", 1)
+    if '+' not in raw:
+        return f'{_infer_po_token_context(player_clients)}+{raw}'
+    prefix, suffix = raw.split('+', 1)
     prefix = prefix.strip()
     suffix = suffix.strip()
     if not suffix:
         return raw
-    if "." in prefix:
-        return f"{prefix}+{suffix}"
-    return f"{_infer_po_token_context(player_clients)}+{suffix}"
+    if '.' in prefix:
+        return f'{prefix}+{suffix}'
+    return f'{_infer_po_token_context(player_clients)}+{suffix}'
+
 
 def s3_client():
     """Create and configure a boto3 S3 client for MinIO/S3 operations.
@@ -772,9 +811,10 @@ def s3_client():
         environment variables for configuration.
     """
     if boto3 is None:
-        raise HTTPException(503, "boto3 is not installed in this runtime")
-    endpoint_url = MINIO_ENDPOINT if "://" in MINIO_ENDPOINT else f"{'https' if MINIO_SECURE else 'http'}://{MINIO_ENDPOINT}"
-    return boto3.client("s3", aws_access_key_id=MINIO_ACCESS_KEY, aws_secret_access_key=MINIO_SECRET_KEY, endpoint_url=endpoint_url)
+        raise HTTPException(503, 'boto3 is not installed in this runtime')
+    endpoint_url = MINIO_ENDPOINT if '://' in MINIO_ENDPOINT else f"{'https' if MINIO_SECURE else 'http'}://{MINIO_ENDPOINT}"
+    return boto3.client('s3', aws_access_key_id=MINIO_ACCESS_KEY, aws_secret_access_key=MINIO_SECRET_KEY, endpoint_url=endpoint_url)
+
 
 async def _nats_connect_loop() -> None:
     """Background task to maintain NATS connection with automatic reconnection.
@@ -796,11 +836,11 @@ async def _nats_connect_loop() -> None:
             closed_event: asyncio.Event = asyncio.Event()
 
             async def _handle_disconnected() -> None:
-                logger.warning("Lost connection to NATS; waiting for reconnect")
+                logger.warning('Lost connection to NATS; waiting for reconnect')
 
             async def _handle_closed() -> None:
                 global _nc
-                logger.warning("NATS connection closed; scheduling reconnect")
+                logger.warning('NATS connection closed; scheduling reconnect')
                 _nc = None
                 closed_event.set()
 
@@ -810,21 +850,19 @@ async def _nats_connect_loop() -> None:
                 closed_cb=_handle_closed,
             )
             _nc = nc
-            logger.info("Connected to NATS at %s", NATS_URL)
+            logger.info('Connected to NATS at %s', NATS_URL)
             backoff = 1.0
             await closed_event.wait()
         except asyncio.CancelledError:
             raise
         except Exception as err:
-            logger.warning("Failed to connect to NATS at %s: %s", NATS_URL, err)
+            logger.warning('Failed to connect to NATS at %s: %s', NATS_URL, err)
             _nc = None
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
 
 
-
-
-@app.get("/healthz")
+@app.get('/healthz')
 def healthz():
     """Health check endpoint with service version and provenance info.
 
@@ -840,16 +878,17 @@ def healthz():
     http_requests_total.labels(method='GET', endpoint='/healthz', status='200').inc()
     meta = version_info()
     prov = {
-        "channel": os.environ.get("YT_CHANNEL") or os.environ.get("CHANNEL"),
-        "origin": os.environ.get("YT_ORIGIN") or os.environ.get("ORIGIN"),
-        "ytdlp_arg_version": os.environ.get("YTDLP_VERSION"),
-        "ytdlp_pip_url": os.environ.get("YTDLP_PIP_URL"),
+        'channel': os.environ.get('YT_CHANNEL') or os.environ.get('CHANNEL'),
+        'origin': os.environ.get('YT_ORIGIN') or os.environ.get('ORIGIN'),
+        'ytdlp_arg_version': os.environ.get('YTDLP_VERSION'),
+        'ytdlp_pip_url': os.environ.get('YTDLP_PIP_URL'),
     }
     # Compact None values
     prov = {k: v for k, v in prov.items() if v}
-    return {"ok": True, "yt_dlp": meta, "provenance": prov}
+    return {'ok': True, 'yt_dlp': meta, 'provenance': prov}
 
-@app.get("/metrics")
+
+@app.get('/metrics')
 def metrics():
     """Prometheus metrics endpoint.
 
@@ -862,7 +901,8 @@ def metrics():
     """
     return Response(generate_latest(PROM_REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
-def _publish_event(topic: str, payload: Dict[str, Any]):
+
+def _publish_event(topic: str, payload: dict[str, Any]):
     """Publish an event to the NATS message bus.
 
     Wraps the payload in an event envelope and publishes it to the specified
@@ -879,20 +919,21 @@ def _publish_event(topic: str, payload: Dict[str, Any]):
     """
     nc = _nc
     if nc is None:
-        logger.warning("NATS client unavailable; dropping event for topic %s", topic)
+        logger.warning('NATS client unavailable; dropping event for topic %s', topic)
         return
 
-    if getattr(nc, "is_closed", True) or getattr(nc, "is_draining", False) or not getattr(nc, "is_connected", False):
-        logger.warning("NATS client not ready (closed=%s, draining=%s, connected=%s); dropping topic %s",
-                       getattr(nc, "is_closed", True), getattr(nc, "is_draining", False), getattr(nc, "is_connected", False), topic)
+    if getattr(nc, 'is_closed', True) or getattr(nc, 'is_draining', False) or not getattr(nc, 'is_connected', False):
+        logger.warning('NATS client not ready (closed=%s, draining=%s, connected=%s); dropping topic %s',
+                       getattr(nc, 'is_closed', True), getattr(nc, 'is_draining', False), getattr(nc, 'is_connected', False), topic)
         return
 
-    msg = envelope(topic, payload, source="pmoves-yt")
+    msg = envelope(topic, payload, source='pmoves-yt')
     try:
-        asyncio.create_task(nc.publish(topic, json.dumps(msg).encode()))
+        _track_background_task(asyncio.create_task(nc.publish(topic, json.dumps(msg).encode())))
         nats_messages_total.labels(subject=topic.replace('.', '_')).inc()
     except Exception as exc:
-        logger.exception("Failed to schedule publish for topic %s: %s", topic, exc)
+        logger.exception('Failed to schedule publish for topic %s: %s', topic, exc)
+
 
 def upload_to_s3(local_path: str, bucket: str, key: str):
     """Upload a file to MinIO/S3 storage.
@@ -914,9 +955,10 @@ def upload_to_s3(local_path: str, bucket: str, key: str):
     s3 = s3_client()
     s3.upload_file(local_path, bucket, key)
     scheme = 'https' if MINIO_SECURE else 'http'
-    return f"{scheme}://{MINIO_ENDPOINT}/{bucket}/{key}"
+    return f'{scheme}://{MINIO_ENDPOINT}/{bucket}/{key}'
 
-def base_prefix(video_id: str, platform: Optional[str] = None):
+
+def base_prefix(video_id: str, platform: str | None = None):
     """Generate the S3 key prefix for a video based on its platform.
 
     Creates a standardized storage prefix for organizing media files by
@@ -931,20 +973,21 @@ def base_prefix(video_id: str, platform: Optional[str] = None):
         S3 key prefix string (e.g., 'yt/dQw4w9WgXcQ' or 'sc/123456').
     """
     safe_vid = _safe_video_id(video_id)
-    prefix = "yt"
+    prefix = 'yt'
     if platform:
         normalized = str(platform).strip().lower()
-        if "youtube" in normalized:
-            prefix = "yt"
-        elif "soundcloud" in normalized:
-            prefix = "sc"
+        if 'youtube' in normalized:
+            prefix = 'yt'
+        elif 'soundcloud' in normalized:
+            prefix = 'sc'
         elif normalized:
-            prefix = normalized.split(":")[0].replace("/", "-")
+            prefix = normalized.split(':')[0].replace('/', '-')
             if not prefix:
-                prefix = "yt"
-    return f"{prefix}/{safe_vid}"
+                prefix = 'yt'
+    return f'{prefix}/{safe_vid}'
 
-def supa_insert(table: str, row: Dict[str,Any]):
+
+def supa_insert(table: str, row: dict[str, Any]):
     """Insert a row into a Supabase/PostgREST table.
 
     Performs a POST request to create a new row in the specified table.
@@ -960,13 +1003,15 @@ def supa_insert(table: str, row: Dict[str,Any]):
     try:
         headers = {'content-type': 'application/json'}
         if SUPA_SERVICE_KEY:
-            headers.update({'apikey': SUPA_SERVICE_KEY, 'Authorization': f"Bearer {SUPA_SERVICE_KEY}"})
-        r = requests.post(f"{SUPA}/{table}", headers=headers, data=json.dumps(row), timeout=20)
-        r.raise_for_status(); return r.json()
+            headers.update({'apikey': SUPA_SERVICE_KEY, 'Authorization': f'Bearer {SUPA_SERVICE_KEY}'})
+        r = requests.post(f'{SUPA}/{table}', headers=headers, data=json.dumps(row), timeout=20)
+        r.raise_for_status()
+        return r.json()
     except Exception:
         return None
 
-def supa_upsert(table: str, row: Dict[str,Any], on_conflict: Optional[str]=None):
+
+def supa_upsert(table: str, row: dict[str, Any], on_conflict: str | None = None):
     """Upsert a row into a Supabase/PostgREST table.
 
     Performs a POST request with upsert semantics (insert or update on conflict).
@@ -982,18 +1027,20 @@ def supa_upsert(table: str, row: Dict[str,Any], on_conflict: Optional[str]=None)
         JSON response from Supabase if successful, None on error.
     """
     try:
-        url = f"{SUPA}/{table}"
+        url = f'{SUPA}/{table}'
         if on_conflict:
-            url += f"?on_conflict={on_conflict}"
+            url += f'?on_conflict={on_conflict}'
         headers = {'content-type': 'application/json', 'prefer': 'resolution=merge-duplicates'}
         if SUPA_SERVICE_KEY:
-            headers.update({'apikey': SUPA_SERVICE_KEY, 'Authorization': f"Bearer {SUPA_SERVICE_KEY}"})
+            headers.update({'apikey': SUPA_SERVICE_KEY, 'Authorization': f'Bearer {SUPA_SERVICE_KEY}'})
         r = requests.post(url, headers=headers, data=json.dumps(row), timeout=20)
-        r.raise_for_status(); return r.json()
+        r.raise_for_status()
+        return r.json()
     except Exception:
         return None
 
-def supa_update(table: str, match: Dict[str,Any], patch: Dict[str,Any]):
+
+def supa_update(table: str, match: dict[str, Any], patch: dict[str, Any]):
     """Update rows in a Supabase/PostgREST table matching criteria.
 
     Performs a PATCH request to update rows that match the specified criteria.
@@ -1012,17 +1059,19 @@ def supa_update(table: str, match: Dict[str,Any], patch: Dict[str,Any]):
         qs = []
         for k, v in match.items():
             encoded = quote(str(v), safe='') if isinstance(v, str) else quote(json.dumps(v), safe='')
-            qs.append(f"{k}=eq.{encoded}")
-        url = f"{SUPA}/{table}?" + "&".join(qs)
+            qs.append(f'{k}=eq.{encoded}')
+        url = f'{SUPA}/{table}?' + '&'.join(qs)
         headers = {'content-type': 'application/json'}
         if SUPA_SERVICE_KEY:
-            headers.update({'apikey': SUPA_SERVICE_KEY, 'Authorization': f"Bearer {SUPA_SERVICE_KEY}"})
+            headers.update({'apikey': SUPA_SERVICE_KEY, 'Authorization': f'Bearer {SUPA_SERVICE_KEY}'})
         r = requests.patch(url, headers=headers, data=json.dumps(patch), timeout=20)
-        r.raise_for_status(); return r.json()
+        r.raise_for_status()
+        return r.json()
     except Exception:
         return None
 
-def supa_get(table: str, match: Dict[str,Any]) -> Optional[List[Dict[str,Any]]]:
+
+def supa_get(table: str, match: dict[str, Any]) -> list[dict[str, Any]] | None:
     """Query rows from a Supabase/PostgREST table matching criteria.
 
     Performs a GET request with eq filters to fetch matching rows.
@@ -1039,18 +1088,19 @@ def supa_get(table: str, match: Dict[str,Any]) -> Optional[List[Dict[str,Any]]]:
         qs = []
         for k, v in match.items():
             encoded = quote(str(v), safe='') if isinstance(v, str) else quote(json.dumps(v), safe='')
-            qs.append(f"{k}=eq.{encoded}")
-        url = f"{SUPA}/{table}?" + "&".join(qs)
-        headers: Dict[str, str] = {}
+            qs.append(f'{k}=eq.{encoded}')
+        url = f'{SUPA}/{table}?' + '&'.join(qs)
+        headers: dict[str, str] = {}
         if SUPA_SERVICE_KEY:
-            headers.update({'apikey': SUPA_SERVICE_KEY, 'Authorization': f"Bearer {SUPA_SERVICE_KEY}"})
+            headers.update({'apikey': SUPA_SERVICE_KEY, 'Authorization': f'Bearer {SUPA_SERVICE_KEY}'})
         r = requests.get(url, headers=headers, timeout=20)
-        r.raise_for_status(); return r.json()
+        r.raise_for_status()
+        return r.json()
     except Exception:
         return None
 
 
-def _parse_upload_date(value: Optional[str]) -> Optional[str]:
+def _parse_upload_date(value: str | None) -> str | None:
     """Parse and normalize a YouTube upload date to ISO 8601 format.
 
     Handles both YouTube's numeric format (YYYYMMDD) and ISO 8601 strings.
@@ -1070,19 +1120,19 @@ def _parse_upload_date(value: Optional[str]) -> Optional[str]:
         return None
     try:
         if len(value) == 8 and value.isdigit():
-            dt = datetime.strptime(value, "%Y%m%d").replace(tzinfo=timezone.utc)
-            return dt.isoformat().replace("+00:00", "Z")
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            dt = datetime.strptime(value, '%Y%m%d').replace(tzinfo=timezone.utc)
+            return dt.isoformat().replace('+00:00', 'Z')
+        dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         else:
             dt = dt.astimezone(timezone.utc)
-        return dt.isoformat().replace("+00:00", "Z")
+        return dt.isoformat().replace('+00:00', 'Z')
     except ValueError:
         return None
 
 
-def _fetch_channel_monitor_context(video_id: str) -> Optional[Dict[str, Any]]:
+def _fetch_channel_monitor_context(video_id: str) -> dict[str, Any] | None:
     """Fetch channel monitoring context for a video from the database.
 
     Queries the pmoves_channel_monitoring table to retrieve channel context
@@ -1097,28 +1147,28 @@ def _fetch_channel_monitor_context(video_id: str) -> Optional[Dict[str, Any]]:
         thumbnail, namespace, tags, priority, subscriber_count, etc.), or None
         if no monitoring record exists.
     """
-    rows = supa_get("pmoves_channel_monitoring", {"video_id": video_id}) or []
+    rows = supa_get('pmoves_channel_monitoring', {'video_id': video_id}) or []
     if not rows:
         return None
     row = rows[0]
-    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    metadata = row.get('metadata') if isinstance(row.get('metadata'), dict) else {}
     context = {
-        "channel_id": row.get("channel_id"),
-        "channel_name": row.get("channel_name"),
-        "channel_url": metadata.get("channel_url") or metadata.get("source_url"),
-        "channel_thumbnail": metadata.get("channel_thumbnail"),
-        "namespace": row.get("namespace"),
-        "tags": row.get("tags"),
-        "priority": row.get("priority"),
-        "last_status": metadata.get("last_status"),
-        "last_status_at": metadata.get("last_status_at"),
-        "subscriber_count": metadata.get("subscriber_count"),
-        "channel_description": metadata.get("channel_description"),
+        'channel_id': row.get('channel_id'),
+        'channel_name': row.get('channel_name'),
+        'channel_url': metadata.get('channel_url') or metadata.get('source_url'),
+        'channel_thumbnail': metadata.get('channel_thumbnail'),
+        'namespace': row.get('namespace'),
+        'tags': row.get('tags'),
+        'priority': row.get('priority'),
+        'last_status': metadata.get('last_status'),
+        'last_status_at': metadata.get('last_status_at'),
+        'subscriber_count': metadata.get('subscriber_count'),
+        'channel_description': metadata.get('channel_description'),
     }
     return _compact(context) or None
 
 
-def _collect_video_metadata(video_id: str) -> Dict[str, Any]:
+def _collect_video_metadata(video_id: str) -> dict[str, Any]:
     """Collect comprehensive metadata for a video from database records.
 
     Aggregates video metadata from multiple sources: the videos table,
@@ -1141,63 +1191,64 @@ def _collect_video_metadata(video_id: str) -> Dict[str, Any]:
             - meta: Full original metadata
             - channel_monitor: Channel monitoring context if available
     """
-    metadata: Dict[str, Any] = {
-        "title": f"YouTube {video_id}",
-        "description": None,
-        "channel": None,
-        "url": f"https://youtube.com/watch?v={video_id}",
-        "published_at": None,
-        "duration": None,
-        "meta": {},
+    metadata: dict[str, Any] = {
+        'title': f'YouTube {video_id}',
+        'description': None,
+        'channel': None,
+        'url': f'https://youtube.com/watch?v={video_id}',
+        'published_at': None,
+        'duration': None,
+        'meta': {},
     }
-    rows = supa_get("videos", {"video_id": video_id}) or []
+    rows = supa_get('videos', {'video_id': video_id}) or []
     if not rows:
         return metadata
 
     row = rows[0]
-    meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
-    provenance = meta.get("provenance") if isinstance(meta.get("provenance"), dict) else {}
-    channel_meta = meta.get("channel") if isinstance(meta.get("channel"), dict) else {}
+    meta = row.get('meta') if isinstance(row.get('meta'), dict) else {}
+    provenance = meta.get('provenance') if isinstance(meta.get('provenance'), dict) else {}
+    channel_meta = meta.get('channel') if isinstance(meta.get('channel'), dict) else {}
     channel_context = _fetch_channel_monitor_context(video_id)
 
-    metadata["title"] = row.get("title") or metadata["title"]
-    metadata["description"] = meta.get("description")
-    metadata["duration"] = meta.get("duration") or meta.get("duration_seconds")
-    metadata["namespace"] = row.get("namespace") or (channel_context or {}).get("namespace")
-    metadata["tags"] = (channel_context or {}).get("tags")
+    metadata['title'] = row.get('title') or metadata['title']
+    metadata['description'] = meta.get('description')
+    metadata['duration'] = meta.get('duration') or meta.get('duration_seconds')
+    metadata['namespace'] = row.get('namespace') or (channel_context or {}).get('namespace')
+    metadata['tags'] = (channel_context or {}).get('tags')
 
-    source_url = row.get("source_url") or provenance.get("original_url")
+    source_url = row.get('source_url') or provenance.get('original_url')
     if isinstance(source_url, str) and source_url.strip():
-        metadata["url"] = source_url.strip()
+        metadata['url'] = source_url.strip()
 
-    upload_date = provenance.get("upload_date") or meta.get("upload_date")
-    published_at = _parse_upload_date(upload_date) or meta.get("published_at")
+    upload_date = provenance.get('upload_date') or meta.get('upload_date')
+    published_at = _parse_upload_date(upload_date) or meta.get('published_at')
     if isinstance(published_at, str):
         parsed = _parse_upload_date(published_at) or published_at
-        metadata["published_at"] = parsed
+        metadata['published_at'] = parsed
 
     channel_details = {
-        "id": (channel_context or {}).get("channel_id") or channel_meta.get("id"),
-        "name": (channel_context or {}).get("channel_name")
-        or channel_meta.get("title")
-        or channel_meta.get("name"),
-        "url": (channel_context or {}).get("channel_url") or channel_meta.get("url"),
-        "thumbnail": (channel_context or {}).get("channel_thumbnail")
-        or channel_meta.get("thumbnail"),
-        "description": (channel_context or {}).get("channel_description")
-        or channel_meta.get("description"),
-        "namespace": (channel_context or {}).get("namespace"),
-        "tags": (channel_context or {}).get("tags"),
-        "priority": (channel_context or {}).get("priority"),
-        "subscriber_count": (channel_context or {}).get("subscriber_count")
-        or channel_meta.get("subscriber_count"),
+        'id': (channel_context or {}).get('channel_id') or channel_meta.get('id'),
+        'name': (channel_context or {}).get('channel_name')
+        or channel_meta.get('title')
+        or channel_meta.get('name'),
+        'url': (channel_context or {}).get('channel_url') or channel_meta.get('url'),
+        'thumbnail': (channel_context or {}).get('channel_thumbnail')
+        or channel_meta.get('thumbnail'),
+        'description': (channel_context or {}).get('channel_description')
+        or channel_meta.get('description'),
+        'namespace': (channel_context or {}).get('namespace'),
+        'tags': (channel_context or {}).get('tags'),
+        'priority': (channel_context or {}).get('priority'),
+        'subscriber_count': (channel_context or {}).get('subscriber_count')
+        or channel_meta.get('subscriber_count'),
     }
-    metadata["channel"] = _compact(channel_details)
+    metadata['channel'] = _compact(channel_details)
     if channel_context:
-        metadata["channel_monitor"] = channel_context
+        metadata['channel_monitor'] = channel_context
 
-    metadata["meta"] = meta
+    metadata['meta'] = meta
     return metadata
+
 
 def _should_use_invidious(exc: Exception) -> bool:
     """Determine if Invidious fallback should be used based on exception.
@@ -1214,37 +1265,39 @@ def _should_use_invidious(exc: Exception) -> bool:
     if not (INVIDIOUS_BASE_URL or (INVIDIOUS_COMPANION_URL and INVIDIOUS_COMPANION_KEY)):
         return False
     # Allow operator to force fallback unconditionally (e.g., during SABR waves)
-    if (os.environ.get("YT_FORCE_FALLBACK", "false").lower() in {"1","true","yes","y"}):
+    if (os.environ.get('YT_FORCE_FALLBACK', 'false').lower() in {'1', 'true', 'yes', 'y'}):
         return True
-    msg = (str(exc) or "").lower()
+    msg = (str(exc) or '').lower()
     indicators = (
         # yt-dlp / SABR / nsig symptoms
-        "signature extraction failed",
-        "nsig",
-        "sabr streaming",
-        "missing a url",
+        'signature extraction failed',
+        'nsig',
+        'sabr streaming',
+        'missing a url',
         # client gating
-        "player_ias",
-        "innertube",
+        'player_ias',
+        'innertube',
         # auth/throttling/region blocks
-        "sign in to confirm",
-        "sign in to view",
-        "only available on certain devices",
+        'sign in to confirm',
+        'sign in to view',
+        'only available on certain devices',
         # http blocks and generic failures
-        "http error 410",
-        "http error 403",
-        "http error 429",
-        "unable to rename file",
-        "downloaded file is empty",
-        "did not get any data blocks",
-        "all connection attempts failed",
-        "yt_dlp returned no info",
+        'http error 410',
+        'http error 403',
+        'http error 429',
+        'unable to rename file',
+        'downloaded file is empty',
+        'did not get any data blocks',
+        'all connection attempts failed',
+        'yt_dlp returned no info',
     )
     return any(indicator in msg for indicator in indicators)
 
-_YT_ID_RE = re.compile(r"(?:v=|/)([0-9A-Za-z_-]{11})(?:[&?/]|$)")
 
-def _extract_video_id(url: str) -> Optional[str]:
+_YT_ID_RE = re.compile(r'(?:v=|/)([0-9A-Za-z_-]{11})(?:[&?/]|$)')
+
+
+def _extract_video_id(url: str) -> str | None:
     """Extract YouTube video ID from a URL or bare video ID.
 
     Supports various YouTube URL formats and bare 11-character video IDs.
@@ -1260,11 +1313,12 @@ def _extract_video_id(url: str) -> Optional[str]:
     match = _YT_ID_RE.search(url)
     if match:
         return match.group(1)
-    if len(url) == 11 and re.match(r"^[0-9A-Za-z_-]{11}$", url):
+    if len(url) == 11 and re.match(r'^[0-9A-Za-z_-]{11}$', url):
         return url
     return None
 
-_SAFE_VID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+_SAFE_VID_RE = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
 
 
 def _safe_video_id(vid: str) -> str:
@@ -1275,11 +1329,11 @@ def _safe_video_id(vid: str) -> str:
     """
     safe = os.path.basename(vid)
     if not safe or safe != vid or not _SAFE_VID_RE.match(safe):
-        raise HTTPException(400, "Invalid video ID")
+        raise HTTPException(400, 'Invalid video ID')
     return safe
 
 
-def _infer_platform(url: Optional[str], entry_meta: Optional[Dict[str, Any]] = None) -> str:
+def _infer_platform(url: str | None, entry_meta: dict[str, Any] | None = None) -> str:
     """Infer the content platform from URL or metadata.
 
     Determines whether content is from YouTube, SoundCloud, or other platforms
@@ -1293,25 +1347,26 @@ def _infer_platform(url: Optional[str], entry_meta: Optional[Dict[str, Any]] = N
         Platform identifier ('youtube', 'soundcloud', etc.). Defaults to 'youtube'.
     """
     if entry_meta:
-        for key in ("platform", "provider", "source"):
+        for key in ('platform', 'provider', 'source'):
             value = entry_meta.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip().lower()
     if url:
         lowered = url.lower()
-        if lowered.startswith("soundcloud:"):
-            return "soundcloud"
+        if lowered.startswith('soundcloud:'):
+            return 'soundcloud'
         try:
             netloc = urlparse(lowered).netloc
-            if netloc == "soundcloud.com" or netloc.endswith(".soundcloud.com"):
-                return "soundcloud"
+            if netloc == 'soundcloud.com' or netloc.endswith('.soundcloud.com'):
+                return 'soundcloud'
         except Exception:
-            logger.debug("_infer_platform: urlparse failed for %r", lowered)
-    return "youtube"
+            logger.debug('_infer_platform: urlparse failed for %r', lowered)
+    return 'youtube'
+
 
 def _apply_provider_defaults(
     platform: str,
-    ydl_opts: Dict[str, Any],
+    ydl_opts: dict[str, Any],
 ) -> None:
     """Apply platform-specific authentication defaults to yt-dlp options.
 
@@ -1322,18 +1377,18 @@ def _apply_provider_defaults(
         platform: Platform identifier ('soundcloud', 'youtube', etc.).
         ydl_opts: yt-dlp options dictionary to modify in-place.
     """
-    if platform == "soundcloud":
-        if SOUNDCLOUD_COOKIEFILE and "cookiefile" not in ydl_opts:
-            ydl_opts["cookiefile"] = SOUNDCLOUD_COOKIEFILE
-        if SOUNDCLOUD_COOKIES_FROM_BROWSER and "cookiesfrombrowser" not in ydl_opts:
-            ydl_opts["cookiesfrombrowser"] = SOUNDCLOUD_COOKIES_FROM_BROWSER
-        if SOUNDCLOUD_USERNAME and "username" not in ydl_opts:
-            ydl_opts["username"] = SOUNDCLOUD_USERNAME
-        if SOUNDCLOUD_PASSWORD and "password" not in ydl_opts:
-            ydl_opts["password"] = SOUNDCLOUD_PASSWORD
+    if platform == 'soundcloud':
+        if SOUNDCLOUD_COOKIEFILE and 'cookiefile' not in ydl_opts:
+            ydl_opts['cookiefile'] = SOUNDCLOUD_COOKIEFILE
+        if SOUNDCLOUD_COOKIES_FROM_BROWSER and 'cookiesfrombrowser' not in ydl_opts:
+            ydl_opts['cookiesfrombrowser'] = SOUNDCLOUD_COOKIES_FROM_BROWSER
+        if SOUNDCLOUD_USERNAME and 'username' not in ydl_opts:
+            ydl_opts['username'] = SOUNDCLOUD_USERNAME
+        if SOUNDCLOUD_PASSWORD and 'password' not in ydl_opts:
+            ydl_opts['password'] = SOUNDCLOUD_PASSWORD
 
 
-def _fetch_po_token_from_companion(video_id: str) -> Optional[str]:
+def _fetch_po_token_from_companion(video_id: str) -> str | None:
     """Fetch a PO token from the Invidious Companion service.
 
     Queries the Invidious Companion API to obtain a PO token for bypassing
@@ -1350,60 +1405,61 @@ def _fetch_po_token_from_companion(video_id: str) -> Optional[str]:
         return None
     if not (INVIDIOUS_COMPANION_URL and INVIDIOUS_COMPANION_KEY):
         return None
-    base = INVIDIOUS_COMPANION_URL.rstrip("/")
-    if not base.endswith("/companion"):
-        base = f"{base}/companion"
+    base = INVIDIOUS_COMPANION_URL.rstrip('/')
+    if not base.endswith('/companion'):
+        base = f'{base}/companion'
     try:
         resp = requests.get(
-            f"{base}/latest_version",
-            params={"id": video_id, "itag": YT_PO_TOKEN_ITAG, "local": "true"},
-            headers={"Authorization": f"Bearer {INVIDIOUS_COMPANION_KEY}"},
+            f'{base}/latest_version',
+            params={'id': video_id, 'itag': YT_PO_TOKEN_ITAG, 'local': 'true'},
+            headers={'Authorization': f'Bearer {INVIDIOUS_COMPANION_KEY}'},
             timeout=10,
             allow_redirects=False,
         )
         if resp.status_code in (301, 302):
-            location = resp.headers.get("location")
+            location = resp.headers.get('location')
             if location:
                 query = parse_qs(urlparse(location).query)
-                token = (query.get("pot") or [None])[0]
+                token = (query.get('pot') or [None])[0]
                 if token:
                     logger.info(
-                        "po_token_fetched",
-                        extra={"event": "po_token_fetched", "video_id": video_id},
+                        'po_token_fetched',
+                        extra={'event': 'po_token_fetched', 'video_id': video_id},
                     )
                     return token
         else:
             logger.warning(
-                "po_token_unexpected_status",
-                extra={"event": "po_token_unexpected_status", "video_id": video_id, "status": resp.status_code},
+                'po_token_unexpected_status',
+                extra={'event': 'po_token_unexpected_status', 'video_id': video_id, 'status': resp.status_code},
             )
     except requests.RequestException as exc:
         logger.warning(
-            "po_token_fetch_failed",
-            extra={"event": "po_token_fetch_failed", "video_id": video_id, "error": str(exc)},
+            'po_token_fetch_failed',
+            extra={'event': 'po_token_fetch_failed', 'video_id': video_id, 'error': str(exc)},
         )
     return None
+
 
 def _download_with_yt_dlp(
     url: str,
     ns: str,
     bucket: str,
-    ydl_opts: Dict[str, Any],
-    postprocessors: Optional[List[Dict[str, Any]]],
+    ydl_opts: dict[str, Any],
+    postprocessors: list[dict[str, Any]] | None,
     write_info_json: bool,
-    job_id: Optional[str],
-    entry_meta: Dict[str, Any],
+    job_id: str | None,
+    entry_meta: dict[str, Any],
     platform: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     success = False
-    vid_dir: Optional[Path] = None
-    platform_key = platform or "youtube"
+    vid_dir: Path | None = None
+    platform_key = platform or 'youtube'
     try:
         with _youtube_dl(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if info is None:
-                raise DownloadError(f"yt_dlp returned no info for {url}")
-            if 'requested_downloads' in info and info['requested_downloads']:
+                raise DownloadError(f'yt_dlp returned no info for {url}')
+            if info.get('requested_downloads'):
                 outpath = info['requested_downloads'][0]['_filename']
             else:
                 outpath = ydl.prepare_filename(info)
@@ -1418,7 +1474,7 @@ def _download_with_yt_dlp(
                 'id': info.get('channel_id') or info.get('uploader_id'),
                 'url': info.get('uploader_url') or info.get('channel_url'),
             }
-            video_meta_patch: Dict[str, Any] = {
+            video_meta_patch: dict[str, Any] = {
                 'thumb': None,
                 'duration': info.get('duration'),
                 'duration_ms': info.get('duration') * 1000 if info.get('duration') else None,
@@ -1452,13 +1508,13 @@ def _download_with_yt_dlp(
                 },
             }
             video_meta_patch = _compact(video_meta_patch) or {}
-            raw_key = f"{base}/raw.mp4"
+            raw_key = f'{base}/raw.mp4'
             s3_url = upload_to_s3(outpath, bucket, raw_key)
             thumb = None
             for ext in ('.jpg', '.png', '.webp'):
-                cand = os.path.join(str(vid_dir), f"{vid}{ext}")  # CodeQL path-injection: vid from yt-dlp info['id'] — constrained alphanumeric
+                cand = os.path.join(str(vid_dir), f'{vid}{ext}')  # CodeQL path-injection: vid from yt-dlp info['id'] — constrained alphanumeric
                 if os.path.exists(cand):
-                    thumb_key = f"{base}/thumb{ext}"
+                    thumb_key = f'{base}/thumb{ext}'
                     thumb = upload_to_s3(cand, bucket, thumb_key)
                     break
             if thumb:
@@ -1475,15 +1531,15 @@ def _download_with_yt_dlp(
                     'duration': info.get('duration'),
                     'channel': _compact(channel_meta) or None,
                     'job_id': job_id,
-                }
+                },
             })
             supa_upsert('videos', {
                 'video_id': vid,
                 'namespace': ns,
                 'title': title,
                 'source_url': url,
-                's3_base_prefix': f"s3://{bucket}/{base}",
-                'meta': {'thumb': thumb}
+                's3_base_prefix': f's3://{bucket}/{base}',
+                'meta': {'thumb': thumb},
             }, on_conflict='video_id')
             if video_meta_patch:
                 _merge_meta(vid, video_meta_patch)
@@ -1503,13 +1559,13 @@ def _download_with_yt_dlp(
                 pass
             success = True
             logger.info(
-                "download_complete",
+                'download_complete',
                 extra={
-                    "event": "download_complete",
-                    "video_id": vid,
-                    "platform": platform_key,
-                    "downloader": "yt-dlp",
-                    "fallback_used": False,
+                    'event': 'download_complete',
+                    'video_id': vid,
+                    'platform': platform_key,
+                    'downloader': 'yt-dlp',
+                    'fallback_used': False,
                 },
             )
             return {'ok': True, 'title': title, 'video_id': vid, 's3_url': s3_url, 'thumb': thumb}
@@ -1517,8 +1573,9 @@ def _download_with_yt_dlp(
         if success and vid_dir is not None:
             shutil.rmtree(vid_dir, ignore_errors=True)
 
-def _choose_invidious_stream(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    def score(stream: Dict[str, Any]) -> int:
+
+def _choose_invidious_stream(data: dict[str, Any]) -> dict[str, Any] | None:
+    def score(stream: dict[str, Any]) -> int:
         label = stream.get('qualityLabel') or stream.get('quality')
         if label and isinstance(label, str) and label.endswith('p'):
             try:
@@ -1536,60 +1593,63 @@ def _choose_invidious_stream(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     fallback.sort(key=score, reverse=True)
     return fallback[0] if fallback else None
 
-def _choose_companion_stream(player_resp: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    streaming = player_resp.get("streamingData") or {}
-    candidates: List[Dict[str, Any]] = streaming.get("formats") or []
+
+def _choose_companion_stream(player_resp: dict[str, Any]) -> dict[str, Any] | None:
+    streaming = player_resp.get('streamingData') or {}
+    candidates: list[dict[str, Any]] = streaming.get('formats') or []
     if not candidates:
-        candidates = streaming.get("adaptiveFormats") or []
+        candidates = streaming.get('adaptiveFormats') or []
     if not candidates:
         return None
-    def score(item: Dict[str, Any]) -> int:
-        height = item.get("height")
+
+    def score(item: dict[str, Any]) -> int:
+        height = item.get('height')
         if isinstance(height, int):
             return height
-        quality = item.get("qualityLabel") or item.get("quality")
-        if isinstance(quality, str) and quality.endswith("p"):
+        quality = item.get('qualityLabel') or item.get('quality')
+        if isinstance(quality, str) and quality.endswith('p'):
             try:
-                return int(quality.rstrip("p"))
+                return int(quality.rstrip('p'))
             except ValueError:
                 return 0
         return 0
     filtered = []
     for fmt in candidates:
-        mime = fmt.get("mimeType") or ""
-        url = fmt.get("url")
+        mime = fmt.get('mimeType') or ''
+        url = fmt.get('url')
         if not url:
             continue
         if INVIDIOUS_FALLBACK_FORMAT and INVIDIOUS_FALLBACK_FORMAT not in mime:
             continue
         filtered.append(fmt)
     if not filtered:
-        filtered = [fmt for fmt in candidates if fmt.get("url")]
+        filtered = [fmt for fmt in candidates if fmt.get('url')]
     filtered.sort(key=score, reverse=True)
     return filtered[0] if filtered else None
+
 
 def _download_with_companion(
     url: str,
     ns: str,
     bucket: str,
-    job_id: Optional[str],
-    entry_meta: Dict[str, Any],
+    job_id: str | None,
+    entry_meta: dict[str, Any],
     platform: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if not YT_COMPANION_ENABLED:
-        raise HTTPException(503, "Invidious companion disabled")
+        raise HTTPException(503, 'Invidious companion disabled')
     if not (INVIDIOUS_COMPANION_URL and INVIDIOUS_COMPANION_KEY):
-        raise HTTPException(503, "Invidious companion not configured")
+        raise HTTPException(503, 'Invidious companion not configured')
     video_id = _extract_video_id(url)
     if not video_id:
-        raise HTTPException(400, "Unable to determine video id for Invidious companion fallback")
+        raise HTTPException(400, 'Unable to determine video id for Invidious companion fallback')
     video_id = _safe_video_id(video_id)
     player_endpoint = f"{INVIDIOUS_COMPANION_URL.rstrip('/')}/companion/youtubei/v1/player"
     headers = {
-        "Authorization": f"Bearer {INVIDIOUS_COMPANION_KEY}",
-        "content-type": "application/json",
+        'Authorization': f'Bearer {INVIDIOUS_COMPANION_KEY}',
+        'content-type': 'application/json',
     }
-    payload = {"videoId": video_id}
+    payload = {'videoId': video_id}
     try:
         resp = requests.post(
             player_endpoint,
@@ -1600,149 +1660,148 @@ def _download_with_companion(
         resp.raise_for_status()
         player_resp = resp.json()
     except Exception as exc:
-        raise HTTPException(502, f"Invidious companion error: {exc}") from exc
+        raise HTTPException(502, f'Invidious companion error: {exc}') from exc
     stream = _choose_companion_stream(player_resp)
     if not stream:
-        raise HTTPException(502, "Invidious companion did not return a playable stream")
-    download_url = stream.get("url")
+        raise HTTPException(502, 'Invidious companion did not return a playable stream')
+    download_url = stream.get('url')
     if not download_url:
-        raise HTTPException(502, "Invidious companion stream missing URL")
-    mime = stream.get("mimeType") or "video/mp4"
-    ext = "mp4"
-    if "webm" in mime:
-        ext = "webm"
+        raise HTTPException(502, 'Invidious companion stream missing URL')
+    mime = stream.get('mimeType') or 'video/mp4'
+    ext = 'mp4'
+    if 'webm' in mime:
+        ext = 'webm'
     base = base_prefix(video_id, platform)
     vid_dir = YT_TEMP_ROOT / video_id  # CodeQL path-injection: sanitized by _safe_video_id (basename + regex allowlist)
     vid_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = vid_dir / f"{video_id}.{ext}"  # CodeQL path-injection: sanitized by _safe_video_id (basename + regex allowlist)
+    tmp_path = vid_dir / f'{video_id}.{ext}'  # CodeQL path-injection: sanitized by _safe_video_id (basename + regex allowlist)
     try:
         with requests.get(download_url, stream=True, timeout=120) as r:
             r.raise_for_status()
-            with open(tmp_path, "wb") as fh:  # CodeQL path-injection: sanitized by _safe_video_id (basename + regex allowlist)
+            with open(tmp_path, 'wb') as fh:  # CodeQL path-injection: sanitized by _safe_video_id (basename + regex allowlist)
                 for chunk in r.iter_content(1 << 20):
                     if chunk:
                         fh.write(chunk)
     except Exception as exc:
         shutil.rmtree(vid_dir, ignore_errors=True)
-        raise HTTPException(502, f"Failed to download via Invidious companion: {exc}") from exc
-    s3_url = upload_to_s3(str(tmp_path), bucket, f"{base}/raw.{ext}")
-    title = entry_meta.get("title") or player_resp.get("videoDetails", {}).get("title") or video_id
+        raise HTTPException(502, f'Failed to download via Invidious companion: {exc}') from exc
+    s3_url = upload_to_s3(str(tmp_path), bucket, f'{base}/raw.{ext}')
+    title = entry_meta.get('title') or player_resp.get('videoDetails', {}).get('title') or video_id
     thumb = None
-    thumbnails = (player_resp.get("videoDetails") or {}).get("thumbnail", {}).get("thumbnails") or []
+    thumbnails = (player_resp.get('videoDetails') or {}).get('thumbnail', {}).get('thumbnails') or []
     if thumbnails:
-        thumb_sorted = sorted(thumbnails, key=lambda t: t.get("width") or 0, reverse=True)
+        thumb_sorted = sorted(thumbnails, key=lambda t: t.get('width') or 0, reverse=True)
         for thumb_entry in thumb_sorted:
-            thumb_url = thumb_entry.get("url")
+            thumb_url = thumb_entry.get('url')
             if not thumb_url:
                 continue
             try:
                 r_thumb = requests.get(thumb_url, timeout=20)
                 r_thumb.raise_for_status()
-                thumb_path = vid_dir / f"{video_id}_thumb.jpg"
-                with open(thumb_path, "wb") as tfh:  # CodeQL path-injection: sanitized by _safe_video_id (basename + regex allowlist)
+                thumb_path = vid_dir / f'{video_id}_thumb.jpg'
+                with open(thumb_path, 'wb') as tfh:  # CodeQL path-injection: sanitized by _safe_video_id (basename + regex allowlist)
                     tfh.write(r_thumb.content)
-                thumb = upload_to_s3(str(thumb_path), bucket, f"{base}/thumb.jpg")
+                thumb = upload_to_s3(str(thumb_path), bucket, f'{base}/thumb.jpg')
                 break
             except Exception:
                 continue
     metadata_patch = _compact({
-        "duration": stream.get("approxDurationMs"),
-        "channel": {
-            "title": (player_resp.get("videoDetails") or {}).get("author"),
-            "id": (player_resp.get("videoDetails") or {}).get("channelId"),
+        'duration': stream.get('approxDurationMs'),
+        'channel': {
+            'title': (player_resp.get('videoDetails') or {}).get('author'),
+            'id': (player_resp.get('videoDetails') or {}).get('channelId'),
         },
-        "provenance": {
-            "source": platform,
-            "original_url": url,
-            "job_id": job_id,
-            "entry": entry_meta,
-            "fallback": "companion",
+        'provenance': {
+            'source': platform,
+            'original_url': url,
+            'job_id': job_id,
+            'entry': entry_meta,
+            'fallback': 'companion',
         },
-        "thumbnails": thumbnails,
-        "statistics": {
-            "view_count": (player_resp.get("videoDetails") or {}).get("viewCount"),
+        'thumbnails': thumbnails,
+        'statistics': {
+            'view_count': (player_resp.get('videoDetails') or {}).get('viewCount'),
         },
     }) or {}
     supa_upsert(
-        "videos",
+        'videos',
         {
-            "video_id": video_id,
-            "namespace": ns,
-            "title": title,
-            "source_url": url,
-            "s3_base_prefix": f"s3://{bucket}/{base}",
-            "meta": {"thumb": thumb, "fallback": "companion"},
+            'video_id': video_id,
+            'namespace': ns,
+            'title': title,
+            'source_url': url,
+            's3_base_prefix': f's3://{bucket}/{base}',
+            'meta': {'thumb': thumb, 'fallback': 'companion'},
         },
-        on_conflict="video_id",
+        on_conflict='video_id',
     )
     if metadata_patch:
         _merge_meta(video_id, metadata_patch)
     supa_upsert(
-        "studio_board",
+        'studio_board',
         {
-            "title": title,
-            "namespace": ns,
-            "content_url": s3_url,
-            "status": "submitted",
-            "meta": {
-                "source": platform,
-                "original_url": url,
-                "thumb": thumb,
-                "job_id": job_id,
-                "fallback": "companion",
+            'title': title,
+            'namespace': ns,
+            'content_url': s3_url,
+            'status': 'submitted',
+            'meta': {
+                'source': platform,
+                'original_url': url,
+                'thumb': thumb,
+                'job_id': job_id,
+                'fallback': 'companion',
             },
         },
-        on_conflict="content_url",
+        on_conflict='content_url',
     )
-    try:
+    with suppress(Exception):
         _publish_event(
-            "ingest.file.added.v1",
+            'ingest.file.added.v1',
             {
-                "bucket": bucket,
-                "key": f"{base}/raw.{ext}",
-                "namespace": ns,
-                "title": title,
-                "source": platform,
-                "video_id": video_id,
+                'bucket': bucket,
+                'key': f'{base}/raw.{ext}',
+                'namespace': ns,
+                'title': title,
+                'source': platform,
+                'video_id': video_id,
             },
         )
-    except Exception:
-        pass
     shutil.rmtree(vid_dir, ignore_errors=True)
     logger.info(
-        "download_complete",
+        'download_complete',
         extra={
-            "event": "download_complete",
-            "video_id": video_id,
-            "platform": platform,
-            "downloader": "invidious_companion",
-            "fallback_used": True,
+            'event': 'download_complete',
+            'video_id': video_id,
+            'platform': platform,
+            'downloader': 'invidious_companion',
+            'fallback_used': True,
         },
     )
-    return {"ok": True, "title": title, "video_id": video_id, "s3_url": s3_url, "thumb": thumb}
+    return {'ok': True, 'title': title, 'video_id': video_id, 's3_url': s3_url, 'thumb': thumb}
+
 
 def _download_with_invidious(
     url: str,
     ns: str,
     bucket: str,
-    job_id: Optional[str],
-    entry_meta: Dict[str, Any],
+    job_id: str | None,
+    entry_meta: dict[str, Any],
     platform: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if not INVIDIOUS_BASE_URL:
         raise HTTPException(503, 'Invidious fallback not configured (INVIDIOUS_BASE_URL missing)')
     video_id = _extract_video_id(url)
     if not video_id:
         raise HTTPException(400, 'Unable to determine YouTube video id for fallback')
     video_id = _safe_video_id(video_id)
-    platform_key = platform or "youtube"
+    platform_key = platform or 'youtube'
     api_url = f"{INVIDIOUS_BASE_URL.rstrip('/')}/api/v1/videos/{video_id}"
     try:
         response = requests.get(api_url, timeout=20)
         response.raise_for_status()
         data = response.json()
     except Exception as exc:
-        raise HTTPException(502, f"Invidious API error: {exc}") from exc
+        raise HTTPException(502, f'Invidious API error: {exc}') from exc
     stream = _choose_invidious_stream(data)
     if not stream:
         raise HTTPException(502, 'Invidious fallback did not return a playable stream')
@@ -1756,7 +1815,7 @@ def _download_with_invidious(
     base = base_prefix(video_id, platform_key)
     vid_dir = YT_TEMP_ROOT / video_id  # CodeQL path-injection: sanitized by _safe_video_id (basename + regex allowlist)
     vid_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = vid_dir / f"{video_id}.{ext}"  # CodeQL path-injection: sanitized by _safe_video_id (basename + regex allowlist)
+    tmp_path = vid_dir / f'{video_id}.{ext}'  # CodeQL path-injection: sanitized by _safe_video_id (basename + regex allowlist)
     try:
         with requests.get(download_url, stream=True, timeout=120) as r:
             r.raise_for_status()
@@ -1766,8 +1825,8 @@ def _download_with_invidious(
                         fh.write(chunk)
     except Exception as exc:
         shutil.rmtree(vid_dir, ignore_errors=True)
-        raise HTTPException(502, f"Failed to download via Invidious: {exc}") from exc
-    s3_url = upload_to_s3(str(tmp_path), bucket, f"{base}/raw.{ext}")
+        raise HTTPException(502, f'Failed to download via Invidious: {exc}') from exc
+    s3_url = upload_to_s3(str(tmp_path), bucket, f'{base}/raw.{ext}')
     thumb_s3 = None
     thumbs = data.get('videoThumbnails') or []
     for thumb in sorted(thumbs, key=lambda t: t.get('width') or 0, reverse=True):
@@ -1778,10 +1837,10 @@ def _download_with_invidious(
             resp = requests.get(thumb_url, timeout=20)
             resp.raise_for_status()
             thumb_ext = 'jpg'
-            thumb_path = vid_dir / f"{video_id}_thumb.{thumb_ext}"
+            thumb_path = vid_dir / f'{video_id}_thumb.{thumb_ext}'
             with open(thumb_path, 'wb') as tfh:  # CodeQL path-injection: sanitized by _safe_video_id (basename + regex allowlist)
                 tfh.write(resp.content)
-            thumb_key = f"{base}/thumb.{thumb_ext}"
+            thumb_key = f'{base}/thumb.{thumb_ext}'
             thumb_s3 = upload_to_s3(str(thumb_path), bucket, thumb_key)
             break
         except Exception:
@@ -1814,8 +1873,8 @@ def _download_with_invidious(
         'namespace': ns,
         'title': title,
         'source_url': url,
-        's3_base_prefix': f"s3://{bucket}/{base}",
-        'meta': {'thumb': thumb_s3, 'fallback': 'invidious'}
+        's3_base_prefix': f's3://{bucket}/{base}',
+        'meta': {'thumb': thumb_s3, 'fallback': 'invidious'},
     }, on_conflict='video_id')
     if video_meta_patch:
         _merge_meta(video_id, video_meta_patch)
@@ -1832,24 +1891,23 @@ def _download_with_invidious(
             'channel': _compact(channel_meta) or None,
             'job_id': job_id,
             'fallback': 'invidious',
-        }
+        },
     }, on_conflict='content_url')
-    try:
+    with suppress(Exception):
         _publish_event('ingest.file.added.v1', {
             'bucket': bucket,
-            'key': f"{base}/raw.{ext}",
+            'key': f'{base}/raw.{ext}',
             'namespace': ns,
             'title': title,
             'source': platform_key,
             'video_id': video_id,
         })
-    except Exception:
-        pass
     shutil.rmtree(vid_dir, ignore_errors=True)
     return {'ok': True, 'title': title, 'video_id': video_id, 's3_url': s3_url, 'thumb': thumb_s3}
 
-@app.post("/yt/info")
-def yt_info(body: Dict[str,Any] = Body(...)):
+
+@app.post('/yt/info')
+def yt_info(body: dict[str, Any] = Body(...)):
     """Fetch video metadata without downloading.
 
     Retrieves metadata for a video including ID, title, uploader, duration,
@@ -1865,7 +1923,8 @@ def yt_info(body: Dict[str,Any] = Body(...)):
         HTTPException: 400 if URL is not provided.
     """
     url = body.get('url')
-    if not url: raise HTTPException(400, 'url required')
+    if not url:
+        raise HTTPException(400, 'url required')
     ydl_opts = _with_ytdlp_defaults({'quiet': True, 'noprogress': True, 'skip_download': True})
     # Metadata probes must not force a playable/download format because
     # upstream extractor availability can vary and cause false 500s.
@@ -1888,11 +1947,12 @@ def yt_info(body: Dict[str,Any] = Body(...)):
         }
         with _youtube_dl(fallback_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-    wanted = {k: info.get(k) for k in ('id','title','uploader','duration','webpage_url')}
+    wanted = {k: info.get(k) for k in ('id', 'title', 'uploader', 'duration', 'webpage_url')}
     return {'ok': True, 'info': wanted}
 
-@app.post("/yt/download")
-def yt_download(body: Dict[str,Any] = Body(...)):
+
+@app.post('/yt/download')
+def yt_download(body: dict[str, Any] = Body(...)):
     """Download a video from YouTube or other platforms to S3/MinIO.
 
     Downloads video and thumbnail files using yt-dlp, uploads them to
@@ -1920,14 +1980,16 @@ def yt_download(body: Dict[str,Any] = Body(...)):
     Raises:
         HTTPException: 400 if URL is not provided.
     """
-    url = body.get('url'); ns = body.get('namespace') or DEFAULT_NAMESPACE
+    url = body.get('url')
+    ns = body.get('namespace') or DEFAULT_NAMESPACE
     bucket = body.get('bucket') or DEFAULT_BUCKET
     job_id = body.get('job_id')
     raw_meta = body.get('entry_meta') or body.get('metadata') or {}
     entry_meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
     platform = _infer_platform(url, entry_meta)
     entry_meta.setdefault('platform', platform)
-    if not url: raise HTTPException(400, 'url required')
+    if not url:
+        raise HTTPException(400, 'url required')
     YT_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
     outtmpl = os.path.join(str(YT_TEMP_ROOT), '%(id)s', '%(id)s.%(ext)s')
     yt_options = body.get('yt_options') or {}
@@ -1949,15 +2011,15 @@ def yt_download(body: Dict[str,Any] = Body(...)):
     }, po_token=session_po_token)
     if session_po_token and video_id_hint:
         logger.info(
-            "po_token_applied",
-            extra={"event": "po_token_applied", "video_id": video_id_hint},
+            'po_token_applied',
+            extra={'event': 'po_token_applied', 'video_id': video_id_hint},
         )
     archive_enabled = bool(yt_options.get('use_download_archive', YT_ENABLE_DOWNLOAD_ARCHIVE))
     archive_path_value = yt_options.get('download_archive', YT_DOWNLOAD_ARCHIVE)
     if archive_enabled and archive_path_value:
         safe_name = os.path.basename(archive_path_value)  # CodeQL path-injection: sanitized by os.path.basename — only filename component retained
         if not safe_name:
-            safe_name = "download-archive.txt"
+            safe_name = 'download-archive.txt'
         archive_path = YT_ARCHIVE_DIR / safe_name
         archive_path.parent.mkdir(parents=True, exist_ok=True)  # CodeQL path-injection: sanitized by os.path.basename above
         ydl_opts['download_archive'] = str(archive_path)
@@ -2001,27 +2063,27 @@ def yt_download(body: Dict[str,Any] = Body(...)):
     try:
         return _download_with_yt_dlp(url, ns, bucket, ydl_opts, postprocessors, write_info_json, job_id, entry_meta, platform)
     except (DownloadError, PostProcessingError) as err:
-        if platform == "youtube" and _should_use_invidious(err):
-            logger.warning("yt-dlp failed, attempting fallback", extra={"video_id": _extract_video_id(url), "error": str(err)})
+        if platform == 'youtube' and _should_use_invidious(err):
+            logger.warning('yt-dlp failed, attempting fallback', extra={'video_id': _extract_video_id(url), 'error': str(err)})
             if YT_COMPANION_ENABLED and INVIDIOUS_COMPANION_URL and INVIDIOUS_COMPANION_KEY:
                 try:
                     return _download_with_companion(url, ns, bucket, job_id, entry_meta, platform)
                 except HTTPException as companion_exc:
-                    logger.exception("companion fallback failed", extra={"video_id": _extract_video_id(url), "error": str(companion_exc)})
+                    logger.exception('companion fallback failed', extra={'video_id': _extract_video_id(url), 'error': str(companion_exc)})
                     raise companion_exc
             if INVIDIOUS_BASE_URL:
-                fallback = _download_with_invidious(url, ns, bucket, job_id, entry_meta, platform)
-                return fallback
-            logger.warning("No Invidious fallback configured; propagating yt-dlp error", extra={"video_id": _extract_video_id(url)})
-            raise HTTPException(500, f"yt-dlp error: {err}") from err
-        raise HTTPException(500, f"yt-dlp error: {err}") from err
+                return _download_with_invidious(url, ns, bucket, job_id, entry_meta, platform)
+            logger.warning('No Invidious fallback configured; propagating yt-dlp error', extra={'video_id': _extract_video_id(url)})
+            raise HTTPException(500, f'yt-dlp error: {err}') from err
+        raise HTTPException(500, f'yt-dlp error: {err}') from err
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(500, f"yt-dlp error: {exc}") from exc
+        raise HTTPException(500, f'yt-dlp error: {exc}') from exc
 
-@app.post("/yt/transcript")
-def yt_transcript(body: Dict[str,Any] = Body(...)):
+
+@app.post('/yt/transcript')
+def yt_transcript(body: dict[str, Any] = Body(...)):
     """Generate or retrieve transcript for a video using FFmpeg-Whisper.
 
     Attempts to download the video if needed, then sends it to the FFmpeg-Whisper
@@ -2048,40 +2110,42 @@ def yt_transcript(body: Dict[str,Any] = Body(...)):
     Raises:
         HTTPException: 400 if video_id not provided, 500 on transcription errors.
     """
-    vid = body.get('video_id'); bucket = body.get('bucket') or DEFAULT_BUCKET
-    if not vid: raise HTTPException(400, 'video_id required')
+    vid = body.get('video_id')
+    bucket = body.get('bucket') or DEFAULT_BUCKET
+    if not vid:
+        raise HTTPException(400, 'video_id required')
     vid = _safe_video_id(vid)
     ns = body.get('namespace') or DEFAULT_NAMESPACE
-    audio_key = f"{base_prefix(vid)}/audio.m4a"
+    audio_key = f'{base_prefix(vid)}/audio.m4a'
     # Ensure raw.mp4 exists before attempting transcription. This triggers
     # yt-dlp with SABR-aware fallbacks (companion/invidious) when needed.
     try:
-        yt_url = f"https://www.youtube.com/watch?v={vid}"
+        yt_url = f'https://www.youtube.com/watch?v={vid}'
         _ = yt_download({'url': yt_url, 'namespace': ns, 'bucket': bucket})
     except HTTPException as dl_exc:
         # If download still fails, continue to ffmpeg-whisper which may be
         # able to transcribe from an existing raw.mp4 if it was uploaded by
         # another path; otherwise we'll return its error below.
         logger.warning(
-            "yt_transcript_prefetch_failed",
-            extra={"event": "yt_transcript_prefetch_failed", "video_id": vid, "error": str(dl_exc.detail) if hasattr(dl_exc, 'detail') else str(dl_exc)},
+            'yt_transcript_prefetch_failed',
+            extra={'event': 'yt_transcript_prefetch_failed', 'video_id': vid, 'error': str(dl_exc.detail) if hasattr(dl_exc, 'detail') else str(dl_exc)},
         )
     # If audio not present, try to extract from raw.mp4 using ffmpeg-whisper
     payload = {
         'bucket': bucket,
-        'key': f"{base_prefix(vid)}/raw.mp4",
+        'key': f'{base_prefix(vid)}/raw.mp4',
         'namespace': ns,
         'out_audio_key': audio_key,
         'language': body.get('language'),
-        'whisper_model': body.get('whisper_model')
+        'whisper_model': body.get('whisper_model'),
     }
     if body.get('provider'):
         payload['provider'] = body['provider']
     try:
-        r = requests.post(f"{FFW_URL}/transcribe", headers={'content-type':'application/json'}, data=json.dumps(payload), timeout=1200)
-        j = r.json() if r.headers.get('content-type','').startswith('application/json') else {}
+        r = requests.post(f'{FFW_URL}/transcribe', headers={'content-type': 'application/json'}, data=json.dumps(payload), timeout=1200)
+        j = r.json() if r.headers.get('content-type', '').startswith('application/json') else {}
         if not r.ok:
-            raise HTTPException(r.status_code, f"ffmpeg-whisper error: {j}")
+            raise HTTPException(r.status_code, f'ffmpeg-whisper error: {j}')
         # Insert transcript row and emit event handled by worker
         transcript_text = j.get('text') or ''
         transcript_meta = _compact({
@@ -2101,11 +2165,11 @@ def yt_transcript(body: Dict[str,Any] = Body(...)):
         if SUPA_SERVICE_KEY:
             try:
                 video_meta = _collect_video_metadata(vid)
-                channel_block = video_meta.get("channel") if isinstance(video_meta.get("channel"), dict) else {}
-                channel_name = channel_block.get("name") if channel_block else video_meta.get("channel")
-                yt_record: Dict[str, Any] = {
+                channel_block = video_meta.get('channel') if isinstance(video_meta.get('channel'), dict) else {}
+                channel_name = channel_block.get('name') if channel_block else video_meta.get('channel')
+                yt_record: dict[str, Any] = {
                     'video_id': vid,
-                    'title': video_meta.get('title') or f"YouTube {vid}",
+                    'title': video_meta.get('title') or f'YouTube {vid}',
                     'description': video_meta.get('description'),
                     'channel': channel_name,
                     'channel_id': channel_block.get('id') if channel_block else None,
@@ -2132,19 +2196,18 @@ def yt_transcript(body: Dict[str,Any] = Body(...)):
                 supa_upsert('youtube_transcripts', yt_record, on_conflict='video_id')
             except Exception as exc:  # pylint: disable=broad-except
                 logger.warning(
-                    "youtube_transcripts_upsert_failed",
-                    extra={"event": "youtube_transcripts_upsert_failed", "video_id": vid, "error": str(exc)},
+                    'youtube_transcripts_upsert_failed',
+                    extra={'event': 'youtube_transcripts_upsert_failed', 'video_id': vid, 'error': str(exc)},
                 )
-        try:
+        with suppress(Exception):
             _publish_event('ingest.transcript.ready.v1', {'video_id': vid, 'namespace': ns, 'bucket': bucket, 'key': audio_key})
-        except Exception:
-            pass
         return {'ok': True, **j}
     except requests.RequestException as e:
-        raise HTTPException(502, f"ffmpeg-whisper unreachable: {e}")
+        raise HTTPException(502, f'ffmpeg-whisper unreachable: {e}')
 
-@app.post("/yt/ingest")
-def yt_ingest(body: Dict[str,Any] = Body(...)):
+
+@app.post('/yt/ingest')
+def yt_ingest(body: dict[str, Any] = Body(...)):
     """Complete ingestion pipeline: download video and generate transcript.
 
     Convenience endpoint that orchestrates the full ingestion process:
@@ -2169,21 +2232,22 @@ def yt_ingest(body: Dict[str,Any] = Body(...)):
         HTTPException: 400 if URL not provided, 502 if Whisper service unreachable.
     """
     # Convenience orchestration: info + download + transcript
-    url = body.get('url'); ns = body.get('namespace') or DEFAULT_NAMESPACE
+    url = body.get('url')
+    ns = body.get('namespace') or DEFAULT_NAMESPACE
     if not url:
         raise HTTPException(400, 'url required')
     bucket = body.get('bucket') or DEFAULT_BUCKET
-    dl: Optional[Dict[str, Any]] = None
+    dl: dict[str, Any] | None = None
     try:
-        logger.info("ingest_started", extra={"event": "ingest_started", "url": url, "namespace": ns})
+        logger.info('ingest_started', extra={'event': 'ingest_started', 'url': url, 'namespace': ns})
         dl = yt_download({'url': url, 'namespace': ns, 'bucket': bucket})
         logger.info(
-            "ingest_download_complete",
+            'ingest_download_complete',
             extra={
-                "event": "ingest_download_complete",
-                "url": url,
-                "namespace": ns,
-                "video_id": dl.get('video_id') if dl else None,
+                'event': 'ingest_download_complete',
+                'url': url,
+                'namespace': ns,
+                'video_id': dl.get('video_id') if dl else None,
             },
         )
         tr_payload = {
@@ -2203,13 +2267,13 @@ def yt_ingest(body: Dict[str,Any] = Body(...)):
             tr_payload.setdefault('diarize', YT_TRANSCRIPT_DIARIZE)
         tr = yt_transcript(tr_payload)
         logger.info(
-            "ingest_transcript_complete",
+            'ingest_transcript_complete',
             extra={
-                "event": "ingest_transcript_complete",
-                "url": url,
-                "namespace": ns,
-                "video_id": dl.get('video_id') if dl else None,
-                "transcript_ok": tr.get('ok'),
+                'event': 'ingest_transcript_complete',
+                'url': url,
+                'namespace': ns,
+                'video_id': dl.get('video_id') if dl else None,
+                'transcript_ok': tr.get('ok'),
             },
         )
     except HTTPException as exc:
@@ -2217,13 +2281,13 @@ def yt_ingest(body: Dict[str,Any] = Body(...)):
         http_requests_total.labels(method='POST', endpoint='/yt/ingest', status=str(exc.status_code)).inc()
         _channel_monitor_notify(dl.get('video_id') if dl else None, 'failed', error=detail)
         logger.exception(
-            "ingest_failed_http",
+            'ingest_failed_http',
             extra={
-                "event": "ingest_failed_http",
-                "url": url,
-                "namespace": ns,
-                "video_id": dl.get('video_id') if dl else None,
-                "error": detail,
+                'event': 'ingest_failed_http',
+                'url': url,
+                'namespace': ns,
+                'video_id': dl.get('video_id') if dl else None,
+                'error': detail,
             },
         )
         raise
@@ -2231,13 +2295,13 @@ def yt_ingest(body: Dict[str,Any] = Body(...)):
         http_requests_total.labels(method='POST', endpoint='/yt/ingest', status='500').inc()
         _channel_monitor_notify(dl.get('video_id') if dl else None, 'failed', error=str(exc))
         logger.exception(
-            "ingest_failed",
+            'ingest_failed',
             extra={
-                "event": "ingest_failed",
-                "url": url,
-                "namespace": ns,
-                "video_id": dl.get('video_id') if dl else None,
-                "error": str(exc),
+                'event': 'ingest_failed',
+                'url': url,
+                'namespace': ns,
+                'video_id': dl.get('video_id') if dl else None,
+                'error': str(exc),
             },
         )
         raise
@@ -2250,16 +2314,16 @@ def yt_ingest(body: Dict[str,Any] = Body(...)):
                 'source': 'pmoves-yt',
                 'namespace': ns,
                 'bucket': bucket,
-            }
+            },
         },
     )
     logger.info(
-        "ingest_completed",
+        'ingest_completed',
         extra={
-            "event": "ingest_completed",
-            "url": url,
-            "namespace": ns,
-            "video_id": dl.get('video_id'),
+            'event': 'ingest_completed',
+            'url': url,
+            'namespace': ns,
+            'video_id': dl.get('video_id'),
         },
     )
     # Track metrics
@@ -2270,7 +2334,8 @@ def yt_ingest(body: Dict[str,Any] = Body(...)):
 
 # -------------------- Playlist / Channel ingestion --------------------
 
-def _extract_entries(url: str) -> List[Dict[str,Any]]:
+
+def _extract_entries(url: str) -> list[dict[str, Any]]:
     """Extract playlist/channel entries without downloading.
 
     Uses yt-dlp's extract_flat mode to quickly retrieve all video IDs
@@ -2289,11 +2354,13 @@ def _extract_entries(url: str) -> List[Dict[str,Any]]:
         out = []
         for e in entries:
             vid = e.get('id') or e.get('url')
-            if not vid: continue
+            if not vid:
+                continue
             out.append({'id': vid, 'title': e.get('title')})
         return out
 
-def _job_create(job_type: str, args: Dict[str,Any]) -> Optional[str]:
+
+def _job_create(job_type: str, args: dict[str, Any]) -> str | None:
     """Create a job record in the yt_jobs table.
 
     Creates a new job tracking record for playlist/channel ingestion tasks.
@@ -2313,7 +2380,8 @@ def _job_create(job_type: str, args: Dict[str,Any]) -> Optional[str]:
         return res.get('id')
     return None
 
-def _job_update(job_id: str, state: str, error: Optional[str]=None):
+
+def _job_update(job_id: str, state: str, error: str | None = None):
     """Update job state and timestamps.
 
     Updates a job's status, setting started_at or finished_at timestamps
@@ -2327,17 +2395,18 @@ def _job_update(job_id: str, state: str, error: Optional[str]=None):
     patch = {'state': state, 'error': error}
     if state == 'running':
         patch['started_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    if state in ('completed','failed'):
+    if state in ('completed', 'failed'):
         patch['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     supa_update('yt_jobs', {'id': job_id}, patch)
+
 
 def _item_upsert(
     job_id: str,
     video_id: str,
     status: str,
-    error: Optional[str] = None,
-    meta: Optional[Dict[str, Any]] = None,
-    retries: Optional[int] = None,
+    error: str | None = None,
+    meta: dict[str, Any] | None = None,
+    retries: int | None = None,
 ):
     """Upsert an item record for a job.
 
@@ -2352,7 +2421,7 @@ def _item_upsert(
         meta: Optional metadata dictionary.
         retries: Optional retry count.
     """
-    row: Dict[str, Any] = {'job_id': job_id, 'video_id': video_id, 'status': status}
+    row: dict[str, Any] = {'job_id': job_id, 'video_id': video_id, 'status': status}
     if error is not None:
         row['error'] = error
     if meta is not None:
@@ -2362,7 +2431,7 @@ def _item_upsert(
     supa_upsert('yt_items', row, on_conflict='job_id,video_id')
 
 
-def _item_update(job_id: str, video_id: str, patch: Dict[str, Any]) -> None:
+def _item_update(job_id: str, video_id: str, patch: dict[str, Any]) -> None:
     """Update an item record for a job.
 
     Updates specific fields of an item tracking record.
@@ -2392,7 +2461,7 @@ class IngestException(Exception):
         self.transient = transient
 
 
-def _is_retryable_error(message: Optional[str]) -> bool:
+def _is_retryable_error(message: str | None) -> bool:
     """Determine if an error message indicates a retryable condition.
 
     Checks for error patterns that suggest temporary issues like rate limits,
@@ -2407,10 +2476,7 @@ def _is_retryable_error(message: Optional[str]) -> bool:
     if not message:
         return True
     lowered = message.lower()
-    for token in ("404", "not found", "private video", "copyright"):
-        if token in lowered:
-            return False
-    return True
+    return all(token not in lowered for token in ('404', 'not found', 'private video', 'copyright'))
 
 
 def _should_retry_exception(exc: BaseException) -> bool:
@@ -2432,7 +2498,7 @@ def _should_retry_exception(exc: BaseException) -> bool:
     return isinstance(exc, (requests.RequestException, DownloadError))
 
 
-def _deep_merge(target: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+def _deep_merge(target: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     """Deep merge two dictionaries.
 
     Recursively merges patch into target, with nested dictionaries merged
@@ -2454,7 +2520,7 @@ def _deep_merge(target: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]
     return merged
 
 
-def _merge_meta(video_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+def _merge_meta(video_id: str, patch: dict[str, Any]) -> dict[str, Any]:
     """Merge metadata patch into existing video metadata.
 
     Fetches existing metadata from the database, deeply merges the patch,
@@ -2468,7 +2534,7 @@ def _merge_meta(video_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
         Merged metadata dictionary.
     """
     rows = supa_get('videos', {'video_id': video_id}) or []
-    current: Dict[str, Any] = {}
+    current: dict[str, Any] = {}
     if rows:
         existing_meta = rows[0].get('meta')
         if isinstance(existing_meta, dict):
@@ -2500,11 +2566,12 @@ def _compact(value: Any) -> Any:
     if isinstance(value, list):
         cleaned_list = [v for v in (_compact(item) for item in value) if v is not None]
         return cleaned_list or None
-    if value in (None, ""):
+    if value in (None, ''):
         return None
     return value
 
-def _ingest_one(video_url: str, ns: str, bucket: str, job_id: Optional[str] = None, entry_meta: Optional[Dict[str, Any]] = None) -> Dict[str,Any]:
+
+def _ingest_one(video_url: str, ns: str, bucket: str, job_id: str | None = None, entry_meta: dict[str, Any] | None = None) -> dict[str, Any]:
     """Ingest a single video (download + transcript).
 
     Performs complete ingestion pipeline for one video: download, transcription,
@@ -2535,7 +2602,7 @@ def _ingest_one(video_url: str, ns: str, bucket: str, job_id: Optional[str] = No
         return {'ok': False, 'error': str(e.detail)}
 
 
-async def _ingest_one_async(video_url: str, ns: str, bucket: str, job_id: Optional[str] = None, entry_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+async def _ingest_one_async(video_url: str, ns: str, bucket: str, job_id: str | None = None, entry_meta: dict[str, Any] | None = None) -> dict[str, Any]:
     """Async wrapper for _ingest_one that raises IngestException on failure.
 
     Runs ingestion in a thread pool and converts errors to IngestException
@@ -2560,8 +2627,9 @@ async def _ingest_one_async(video_url: str, ns: str, bucket: str, job_id: Option
         raise IngestException(msg, transient=_is_retryable_error(msg))
     return result
 
+
 @app.post('/yt/playlist')
-async def yt_playlist(body: Dict[str,Any] = Body(...)):
+async def yt_playlist(body: dict[str, Any] = Body(...)):
     """Ingest all videos from a playlist URL.
 
     Extracts video entries from a playlist, downloads and transcribes each video
@@ -2580,7 +2648,9 @@ async def yt_playlist(body: Dict[str,Any] = Body(...)):
     Raises:
         HTTPException: 400 if URL not provided or no entries found.
     """
-    url = body.get('url'); ns = body.get('namespace') or DEFAULT_NAMESPACE; bucket = body.get('bucket') or DEFAULT_BUCKET
+    url = body.get('url')
+    ns = body.get('namespace') or DEFAULT_NAMESPACE
+    bucket = body.get('bucket') or DEFAULT_BUCKET
     if not url:
         raise HTTPException(400, 'url required')
     limit = int(body.get('max_videos') or YT_PLAYLIST_MAX)
@@ -2611,14 +2681,14 @@ async def yt_playlist(body: Dict[str,Any] = Body(...)):
                 await asyncio.sleep(wait_for)
             last_request['ts'] = time.monotonic()
 
-    async def worker(position: int, entry: Dict[str, Any]):
+    async def worker(position: int, entry: dict[str, Any]):
         vid_id = entry['id']
         meta = {'title': entry.get('title'), 'position': position}
         if job_id:
             _item_upsert(job_id, vid_id, 'queued', None, meta, retries=0)
-        video_url = f"https://www.youtube.com/watch?v={vid_id}" if len(vid_id) == 11 else vid_id
+        video_url = f'https://www.youtube.com/watch?v={vid_id}' if len(vid_id) == 11 else vid_id
 
-        async def attempt_ingest() -> Dict[str, Any]:
+        async def attempt_ingest() -> dict[str, Any]:
             async with semaphore:
                 await respect_rate_limit()
                 return await _ingest_one_async(video_url, ns, bucket, job_id=job_id, entry_meta=meta)
@@ -2670,8 +2740,9 @@ async def yt_playlist(body: Dict[str,Any] = Body(...)):
         _job_update(job_id, 'failed' if any_failures else 'completed', None if not any_failures else 'one or more items failed')
     return {'ok': not any_failures, 'job_id': job_id, 'count': len(results), 'results': results}
 
+
 @app.post('/yt/channel')
-async def yt_channel(body: Dict[str,Any] = Body(...)):
+async def yt_channel(body: dict[str, Any] = Body(...)):
     """Ingest all videos from a YouTube channel.
 
     Accepts either a channel URL or channel ID, converts to appropriate URL format,
@@ -2696,10 +2767,11 @@ async def yt_channel(body: Dict[str,Any] = Body(...)):
         raise HTTPException(400, 'url or channel_id required')
     # yt-dlp accepts channel URLs; if only id provided, build URL
     if not base.startswith('http'):
-        base = f"https://www.youtube.com/channel/{base}/videos"
+        base = f'https://www.youtube.com/channel/{base}/videos'
     return await yt_playlist({'url': base, 'namespace': body.get('namespace'), 'bucket': body.get('bucket'), 'max_videos': body.get('max_videos')})
 
 # -------------------- Gemma Summarization --------------------
+
 
 def _summarize_ollama(text: str, style: str) -> str:
     """Summarize text using Ollama API with Gemma model.
@@ -2717,14 +2789,15 @@ def _summarize_ollama(text: str, style: str) -> str:
     Raises:
         HTTPException: 502 if Ollama request fails.
     """
-    prompt = f"You are a skilled video summarizer. Style={style}. Summarize the transcript below succinctly.\n\nTranscript:\n{text[:12000]}"
+    prompt = f'You are a skilled video summarizer. Style={style}. Summarize the transcript below succinctly.\n\nTranscript:\n{text[:12000]}'
     try:
-        r = requests.post(f"{OLLAMA_URL}/api/generate", json={"model": YT_GEMMA_MODEL, "prompt": prompt, "stream": False}, timeout=180)
+        r = requests.post(f'{OLLAMA_URL}/api/generate', json={'model': YT_GEMMA_MODEL, 'prompt': prompt, 'stream': False}, timeout=180)
         r.raise_for_status()
         j = r.json()
         return j.get('response') or j.get('data') or ''
     except Exception as e:
-        raise HTTPException(502, f"Ollama summarization failed: {e}")
+        raise HTTPException(502, f'Ollama summarization failed: {e}')
+
 
 def _summarize_hf(text: str, style: str) -> str:
     """Summarize text using HuggingFace Transformers with Gemma model.
@@ -2747,20 +2820,21 @@ def _summarize_hf(text: str, style: str) -> str:
         import torch  # noqa: F401
         from transformers import AutoTokenizer, AutoModelForCausalLM
     except Exception:
-        raise HTTPException(500, "HF Transformers not installed; use provider=ollama or install transformers+torch")
+        raise HTTPException(500, 'HF Transformers not installed; use provider=ollama or install transformers+torch')
     try:
         tok = AutoTokenizer.from_pretrained(HF_GEMMA_MODEL, token=HF_TOKEN)
-        model = AutoModelForCausalLM.from_pretrained(HF_GEMMA_MODEL, device_map="auto" if HF_USE_GPU else None, torch_dtype="auto")
-        sys_prompt = f"Summarize the following transcript in style={style}. Keep it concise and faithful."
-        prompt = f"<start_of_turn>user\n{sys_prompt}\n\nTranscript:\n{text[:8000]}<end_of_turn>\n<start_of_turn>model\n"
+        model = AutoModelForCausalLM.from_pretrained(HF_GEMMA_MODEL, device_map='auto' if HF_USE_GPU else None, torch_dtype='auto')
+        sys_prompt = f'Summarize the following transcript in style={style}. Keep it concise and faithful.'
+        prompt = f'<start_of_turn>user\n{sys_prompt}\n\nTranscript:\n{text[:8000]}<end_of_turn>\n<start_of_turn>model\n'
         inputs = tok(prompt, return_tensors='pt').to(model.device)
         out = model.generate(**inputs, max_new_tokens=512, temperature=0.3)
         s = tok.decode(out[0], skip_special_tokens=True)
-        return s.split("<start_of_turn>model",1)[-1].strip()
+        return s.split('<start_of_turn>model', 1)[-1].strip()
     except Exception as e:
-        raise HTTPException(500, f"HF Gemma generation failed: {e}")
+        raise HTTPException(500, f'HF Gemma generation failed: {e}')
 
-def _get_transcript(video_id: str) -> Dict[str,Any]:
+
+def _get_transcript(video_id: str) -> dict[str, Any]:
     """Retrieve transcript for a video from the database.
 
     Fetches the transcript record including text and segments from
@@ -2781,7 +2855,8 @@ def _get_transcript(video_id: str) -> Dict[str,Any]:
     meta = row.get('meta') or {}
     return {'text': row.get('text') or '', 'segments': meta.get('segments') or []}
 
-def _merge_video_meta(video_id: str, gemma_patch: Dict[str, Any]) -> None:
+
+def _merge_video_meta(video_id: str, gemma_patch: dict[str, Any]) -> None:
     """Merge Gemma-generated content into video metadata.
 
     Updates the video's meta field with summaries, chapters, or other
@@ -2793,8 +2868,9 @@ def _merge_video_meta(video_id: str, gemma_patch: Dict[str, Any]) -> None:
     """
     _merge_meta(video_id, {'gemma': gemma_patch})
 
+
 @app.post('/yt/summarize')
-def yt_summarize(body: Dict[str,Any] = Body(...)):
+def yt_summarize(body: dict[str, Any] = Body(...)):
     """Generate an AI summary for a video transcript.
 
     Uses Gemma model via Ollama or HuggingFace to summarize video transcript.
@@ -2813,12 +2889,15 @@ def yt_summarize(body: Dict[str,Any] = Body(...)):
     Raises:
         HTTPException: 400 if video_id not provided, 404 if transcript not found.
     """
-    vid = body.get('video_id'); provider = (body.get('provider') or YT_SUMMARY_PROVIDER).lower()
+    vid = body.get('video_id')
+    provider = (body.get('provider') or YT_SUMMARY_PROVIDER).lower()
     style = (body.get('style') or 'short')
-    if not vid: raise HTTPException(400, 'video_id required')
+    if not vid:
+        raise HTTPException(400, 'video_id required')
     tr = _get_transcript(vid)
     text = body.get('text') or tr.get('text')
-    if not text: raise HTTPException(404, 'transcript not found; run /yt/transcript first')
+    if not text:
+        raise HTTPException(404, 'transcript not found; run /yt/transcript first')
     if provider == 'hf':
         summary = _summarize_hf(text, style)
     else:
@@ -2826,14 +2905,13 @@ def yt_summarize(body: Dict[str,Any] = Body(...)):
     # persist into videos + studio_board meta
     _merge_video_meta(vid, {'style': style, 'provider': provider, 'summary': summary})
     # emit event for downstream (Discord/NATS)
-    try:
+    with suppress(Exception):
         _publish_event('ingest.summary.ready.v1', {'video_id': vid, 'style': style, 'provider': provider, 'summary': summary[:500]})
-    except Exception:
-        pass
     return {'ok': True, 'video_id': vid, 'provider': provider, 'style': style, 'summary': summary}
 
+
 @app.post('/yt/chapters')
-def yt_chapters(body: Dict[str,Any] = Body(...)):
+def yt_chapters(body: dict[str, Any] = Body(...)):
     """Generate chapter markers for a video transcript.
 
     Uses Gemma model to analyze transcript and generate chapter titles
@@ -2851,31 +2929,33 @@ def yt_chapters(body: Dict[str,Any] = Body(...)):
     Raises:
         HTTPException: 400 if video_id not provided, 404 if transcript not found.
     """
-    vid = body.get('video_id'); provider = (body.get('provider') or YT_SUMMARY_PROVIDER).lower()
-    if not vid: raise HTTPException(400, 'video_id required')
+    vid = body.get('video_id')
+    provider = (body.get('provider') or YT_SUMMARY_PROVIDER).lower()
+    if not vid:
+        raise HTTPException(400, 'video_id required')
     tr = _get_transcript(vid)
     text = body.get('text') or tr.get('text')
-    if not text: raise HTTPException(404, 'transcript not found; run /yt/transcript first')
-    guide = "Produce 5-12 chapters. JSON array of objects: {title, blurb}. No extra prose."
+    if not text:
+        raise HTTPException(404, 'transcript not found; run /yt/transcript first')
+    guide = 'Produce 5-12 chapters. JSON array of objects: {title, blurb}. No extra prose.'
     if provider == 'hf':
-        raw = _summarize_hf(text, f"chapters; {guide}")
+        raw = _summarize_hf(text, f'chapters; {guide}')
     else:
-        raw = _summarize_ollama(text, f"chapters; {guide}")
+        raw = _summarize_ollama(text, f'chapters; {guide}')
     # try parse JSON array
-    chapters: List[Dict[str,Any]] = []
+    chapters: list[dict[str, Any]] = []
     try:
         # find first [ ... ] block
-        s = raw[raw.find('['): raw.rfind(']')+1]
+        s = raw[raw.find('['): raw.rfind(']') + 1]
         chapters = json.loads(s)
     except Exception:
         # fallback: split lines
-        chapters = [{ 'title': line.strip('- ').strip(), 'blurb': '' } for line in raw.splitlines() if line.strip()][:10]
+        chapters = [{'title': line.strip('- ').strip(), 'blurb': ''} for line in raw.splitlines() if line.strip()][:10]
     _merge_video_meta(vid, {'chapters': chapters})
-    try:
+    with suppress(Exception):
         _publish_event('ingest.chapters.ready.v1', {'video_id': vid, 'n': len(chapters), 'chapters': chapters[:6]})
-    except Exception:
-        pass
     return {'ok': True, 'video_id': vid, 'chapters': chapters}
+
 
 @app.post('/yt/docs/sync')
 def yt_docs_sync(_: None = Depends(require_docs_sync_access)):
@@ -2895,9 +2975,10 @@ def yt_docs_sync(_: None = Depends(require_docs_sync_access)):
     try:
         docs = collect_yt_dlp_docs()
         result = sync_to_supabase(docs)
-        return {"ok": True, **result}
+        return {'ok': True, **result}
     except Exception as exc:  # pragma: no cover
-        raise HTTPException(500, f"docs sync failed: {exc}")
+        raise HTTPException(500, f'docs sync failed: {exc}')
+
 
 @app.get('/yt/docs/catalog')
 def yt_docs_catalog():
@@ -2916,14 +2997,15 @@ def yt_docs_catalog():
     try:
         cat = options_catalog()
         meta = version_info()
-        meta["extractor_count"] = extractor_count()
-        return {"ok": True, "meta": meta, **cat}
+        meta['extractor_count'] = extractor_count()
+        return {'ok': True, 'meta': meta, **cat}
     except Exception as exc:  # pragma: no cover
-        raise HTTPException(500, f"catalog error: {exc}")
+        raise HTTPException(500, f'catalog error: {exc}')
 
 # -------------------- Segmentation → JSONL + CGP emit --------------------
 
-def _segment_transcript(text: str, doc_id: str, namespace: str) -> List[Dict[str,Any]]:
+
+def _segment_transcript(text: str, doc_id: str, namespace: str) -> list[dict[str, Any]]:
     """Segment transcript text into chunks for knowledge indexing.
 
     Simple sentence/paragraph-based segmentation targeting ~1000 characters
@@ -2940,25 +3022,26 @@ def _segment_transcript(text: str, doc_id: str, namespace: str) -> List[Dict[str
     """
     # Naive sentence/paragraph segmentation by punctuation + length budget
     # Target ~900-1200 chars per chunk
-    chunks: List[Dict[str,Any]] = []
+    chunks: list[dict[str, Any]] = []
     buf = []
     budget = 1000
+
     def flush():
         if not buf:
             return
         content = ' '.join(buf).strip()
         if content:
-            chunk_id = f"{doc_id}:{len(chunks)}"
+            chunk_id = f'{doc_id}:{len(chunks)}'
             chunks.append({
                 'doc_id': doc_id,
                 'section_id': None,
                 'chunk_id': chunk_id,
                 'text': content,
                 'namespace': namespace,
-                'payload': {'source': 'youtube'}
+                'payload': {'source': 'youtube'},
             })
         buf.clear()
-    for part in re.split(r"(?<=[\.!?])\s+|\n+", text):
+    for part in re.split(r'(?<=[\.!?])\s+|\n+', text):
         if not part:
             continue
         buf.append(part)
@@ -2967,19 +3050,20 @@ def _segment_transcript(text: str, doc_id: str, namespace: str) -> List[Dict[str
     flush()
     # ensure at least one chunk
     if not chunks and text:
-        chunks.append({'doc_id': doc_id, 'section_id': None, 'chunk_id': f"{doc_id}:0", 'text': text[:1200], 'namespace': namespace, 'payload': {'source': 'youtube'}})
+        chunks.append({'doc_id': doc_id, 'section_id': None, 'chunk_id': f'{doc_id}:0', 'text': text[:1200], 'namespace': namespace, 'payload': {'source': 'youtube'}})
     return chunks
 
+
 def _segment_from_whisper_segments(
-    segments: List[Dict[str,Any]],
+    segments: list[dict[str, Any]],
     doc_id: str,
     namespace: str,
-    target_dur: float = None,
-    gap_thresh: float = None,
-    min_chars: int = None,
-    max_chars: int = None,
-    max_dur: float = None,
-) -> List[Dict[str,Any]]:
+    target_dur: float | None = None,
+    gap_thresh: float | None = None,
+    min_chars: int | None = None,
+    max_chars: int | None = None,
+    max_dur: float | None = None,
+) -> list[dict[str, Any]]:
     """Segment transcript using Whisper time-aligned segments with smart boundaries.
 
     Groups Whisper segments into chunks based on duration, gaps, and punctuation
@@ -3004,11 +3088,12 @@ def _segment_from_whisper_segments(
     min_chars = min_chars if min_chars is not None else YT_SEG_MIN_CHARS
     max_chars = max_chars if max_chars is not None else YT_SEG_MAX_CHARS
     max_dur = max_dur if max_dur is not None else YT_SEG_MAX_DUR
-    chunks: List[Dict[str,Any]] = []
-    cur: List[Dict[str,Any]] = []
+    chunks: list[dict[str, Any]] = []
+    cur: list[dict[str, Any]] = []
     cur_dur = 0.0
     cur_chars = 0
     last_end = None
+
     def flush():
         nonlocal cur, cur_dur, cur_chars
         if not cur:
@@ -3016,20 +3101,21 @@ def _segment_from_whisper_segments(
         start = float(cur[0].get('start') or 0.0)
         end = float(cur[-1].get('end') or start)
         text = ' '.join((s.get('text') or '').strip() for s in cur).strip()
-        chunk_id = f"{doc_id}:{len(chunks)}"
+        chunk_id = f'{doc_id}:{len(chunks)}'
         chunks.append({
             'doc_id': doc_id,
             'section_id': None,
             'chunk_id': chunk_id,
             'text': text,
             'namespace': namespace,
-            'payload': {'source': 'youtube', 't_start': start, 't_end': end}
+            'payload': {'source': 'youtube', 't_start': start, 't_end': end},
         })
         cur = []
         cur_dur = 0.0
         cur_chars = 0
     for s in segments:
-        st = float(s.get('start') or 0.0); en = float(s.get('end') or st)
+        st = float(s.get('start') or 0.0)
+        en = float(s.get('end') or st)
         d = max(0.0, en - st)
         seg_text = s.get('text') or ''
         cur.append({'start': st, 'end': en, 'text': seg_text})
@@ -3045,10 +3131,11 @@ def _segment_from_whisper_segments(
     flush()
     if not chunks and segments:
         s0 = segments[0]
-        chunks.append({'doc_id': doc_id, 'section_id': None, 'chunk_id': f"{doc_id}:0", 'text': s0.get('text') or '', 'namespace': namespace, 'payload': {'source':'youtube','t_start': float(s0.get('start') or 0.0),'t_end': float(s0.get('end') or 0.0)}})
+        chunks.append({'doc_id': doc_id, 'section_id': None, 'chunk_id': f'{doc_id}:0', 'text': s0.get('text') or '', 'namespace': namespace, 'payload': {'source': 'youtube', 't_start': float(s0.get('start') or 0.0), 't_end': float(s0.get('end') or 0.0)}})
     return chunks
 
-def _auto_tune_segment_params(segments: List[Dict[str,Any]], text: str) -> Dict[str,Any]:
+
+def _auto_tune_segment_params(segments: list[dict[str, Any]], text: str) -> dict[str, Any]:
     """Infer content profile (dialogue, talk, music/lyrics) and adjust thresholds.
 
     Analyzes transcript characteristics to optimize segmentation parameters for
@@ -3075,7 +3162,8 @@ def _auto_tune_segment_params(segments: List[Dict[str,Any]], text: str) -> Dict[
     word_counts = []
     durations = []
     for s in segments:
-        st = float(s.get('start') or 0.0); en = float(s.get('end') or st)
+        st = float(s.get('start') or 0.0)
+        en = float(s.get('end') or st)
         d = max(0.0, en - st)
         durations.append(d)
         total_dur += d
@@ -3085,12 +3173,12 @@ def _auto_tune_segment_params(segments: List[Dict[str,Any]], text: str) -> Dict[
         if prev_end is not None:
             gaps.append(max(0.0, st - prev_end))
         prev_end = en
-    avg_gap = (sum(gaps)/len(gaps)) if gaps else 0.0
-    avg_dur = (sum(durations)/len(durations)) if durations else 0.0
-    avg_words = (sum(word_counts)/len(word_counts)) if word_counts else 0.0
-    wps = (total_words/total_dur) if total_dur > 0 else 0.0
+    avg_gap = (sum(gaps) / len(gaps)) if gaps else 0.0
+    avg_dur = (sum(durations) / len(durations)) if durations else 0.0
+    avg_words = (sum(word_counts) / len(word_counts)) if word_counts else 0.0
+    wps = (total_words / total_dur) if total_dur > 0 else 0.0
     # simple repetition/lyrics signal: many short lines and duplicates
-    lines = [ (s.get('text') or '').strip().lower() for s in segments ]
+    lines = [(s.get('text') or '').strip().lower() for s in segments]
     short_lines = sum(1 for l in lines if 0 < len(l) <= 40)
     unique_ratio = len(set(l for l in lines if l)) / max(1, len([l for l in lines if l]))
     has_music_tag = ('[music]' in text.lower()) or ('♪' in text)
@@ -3102,23 +3190,24 @@ def _auto_tune_segment_params(segments: List[Dict[str,Any]], text: str) -> Dict[
         min_chars=YT_SEG_MIN_CHARS,
         max_chars=YT_SEG_MAX_CHARS,
         max_dur=YT_SEG_MAX_DUR,
-        profile='talk'
+        profile='talk',
     )
     # Dialogue: rapid turns, short segments, small gaps
     if avg_dur < 3.0 and avg_words < 12 and avg_gap < 0.8 and wps >= 2.0:
-        params.update(dict(target_dur=max(15.0, YT_SEG_TARGET_DUR*0.67), gap_thresh=0.8, min_chars=max(400, YT_SEG_MIN_CHARS-200), max_chars=min(1200, YT_SEG_MAX_CHARS), max_dur=min(45.0, YT_SEG_MAX_DUR), profile='dialogue'))
+        params.update(dict(target_dur=max(15.0, YT_SEG_TARGET_DUR * 0.67), gap_thresh=0.8, min_chars=max(400, YT_SEG_MIN_CHARS - 200), max_chars=min(1200, YT_SEG_MAX_CHARS), max_dur=min(45.0, YT_SEG_MAX_DUR), profile='dialogue'))
         return params
     # Music/Lyrics: many short lines, repeated phrases, music cues
-    if has_music_tag or (short_lines/ max(1,len(lines)) > 0.6 and unique_ratio < 0.9 and avg_words < 8):
+    if has_music_tag or (short_lines / max(1, len(lines)) > 0.6 and unique_ratio < 0.9 and avg_words < 8):
         params.update(dict(target_dur=15.0, gap_thresh=0.6, min_chars=350, max_chars=900, max_dur=30.0, profile='lyrics'))
         return params
     # Long-form talk / lecture: long segments, slower wps
     if avg_dur >= 3.5 and avg_words >= 12 and wps <= 2.0:
-        params.update(dict(target_dur=min(50.0, YT_SEG_TARGET_DUR*1.33), gap_thresh=max(1.5, YT_SEG_GAP_THRESH), min_chars=max(700, YT_SEG_MIN_CHARS), max_chars=min(1800, YT_SEG_MAX_CHARS+300), max_dur=min(75.0, YT_SEG_MAX_DUR+15), profile='talk-long'))
+        params.update(dict(target_dur=min(50.0, YT_SEG_TARGET_DUR * 1.33), gap_thresh=max(1.5, YT_SEG_GAP_THRESH), min_chars=max(700, YT_SEG_MIN_CHARS), max_chars=min(1800, YT_SEG_MAX_CHARS + 300), max_dur=min(75.0, YT_SEG_MAX_DUR + 15), profile='talk-long'))
         return params
     return params
 
-def _normalise(values: List[float]) -> List[float]:
+
+def _normalise(values: list[float]) -> list[float]:
     """Normalize a list of floats to sum to 1.0.
 
     Creates a probability distribution from a list of values, handling
@@ -3138,7 +3227,7 @@ def _normalise(values: List[float]) -> List[float]:
     return [v / total for v in values]
 
 
-def _build_cgp(video_id: str, chunks: List[Dict[str,Any]], title: Optional[str], namespace: str) -> Dict[str,Any]:
+def _build_cgp(video_id: str, chunks: list[dict[str, Any]], title: str | None, namespace: str) -> dict[str, Any]:
     """Build a Compressed Geometry Proxy (CGP) for video chunks.
 
     Creates a Geometry Bus CHIT structure with spectrum, points, and metadata
@@ -3191,7 +3280,7 @@ def _build_cgp(video_id: str, chunks: List[Dict[str,Any]], title: Optional[str],
             mf_vals.extend([0.0] * (nbins - len(mf_vals)))
         spectrum = _normalise(mf_vals)
     else:
-        decay_cache: Dict[int, float] = {}
+        decay_cache: dict[int, float] = {}
         for idx in range(n):
             frac = (idx + 0.5) / n
             center = min(nbins - 1, int(frac * nbins))
@@ -3211,22 +3300,22 @@ def _build_cgp(video_id: str, chunks: List[Dict[str,Any]], title: Optional[str],
     points = []
     for i, ch in enumerate(chunks):
         points.append({
-            'id': f"p:yt:{video_id}:{i}",
+            'id': f'p:yt:{video_id}:{i}',
             'modality': 'video',
             'ref_id': video_id,
             't_start': (ch.get('payload') or {}).get('t_start'),
             't_end': (ch.get('payload') or {}).get('t_end'),
-            'proj': float((i+1)/n),
+            'proj': float((i + 1) / n),
             'conf': 1.0,
-            'text': ch['text'][:400]
+            'text': ch['text'][:400],
         })
     c = {
-        'id': f"c:yt:{video_id}",
-        'summary': title or f"YouTube {video_id}",
+        'id': f'c:yt:{video_id}',
+        'summary': title or f'YouTube {video_id}',
         'spectrum': [float(round(val, 6)) for val in spectrum],
-        'points': points
+        'points': points,
     }
-    meta: Dict[str, Any] = {'source': 'pmoves-yt', 'video_id': video_id, 'namespace': namespace, 'bins': nbins}
+    meta: dict[str, Any] = {'source': 'pmoves-yt', 'video_id': video_id, 'namespace': namespace, 'bins': nbins}
     if pack:
         meta['pack_id'] = pack.get('id')
         meta['builder_pack'] = {
@@ -3248,7 +3337,7 @@ def _build_cgp(video_id: str, chunks: List[Dict[str,Any]], title: Optional[str],
 
 
 @app.post('/yt/smoke/seed-pack')
-def yt_smoke_seed_pack(body: Dict[str, Any] = Body({})):
+def yt_smoke_seed_pack(body: dict[str, Any] = Body({})):
     """Create or seed a geometry parameter pack for CGP building.
 
     Creates a geometry parameter pack record in the database for testing
@@ -3278,7 +3367,7 @@ def yt_smoke_seed_pack(body: Dict[str, Any] = Body({})):
         'K': 2,
         'tau': 0.9,
         'beta': 1.15,
-        'spectrum_mode': 'histogram'
+        'spectrum_mode': 'histogram',
     }
     payload = {
         'id': pack_id,
@@ -3294,9 +3383,9 @@ def yt_smoke_seed_pack(body: Dict[str, Any] = Body({})):
     try:
         headers = {'content-type': 'application/json', 'prefer': 'return=representation'}
         if SUPA_SERVICE_KEY:
-            headers.update({'apikey': SUPA_SERVICE_KEY, 'Authorization': f"Bearer {SUPA_SERVICE_KEY}"})
+            headers.update({'apikey': SUPA_SERVICE_KEY, 'Authorization': f'Bearer {SUPA_SERVICE_KEY}'})
         resp = requests.post(
-            f"{SUPA}/geometry_parameter_packs",
+            f'{SUPA}/geometry_parameter_packs',
             headers=headers,
             data=json.dumps(payload),
             timeout=20,
@@ -3304,7 +3393,7 @@ def yt_smoke_seed_pack(body: Dict[str, Any] = Body({})):
         resp.raise_for_status()
         rows = resp.json() if resp.headers.get('content-type', '').startswith('application/json') else []
     except Exception as exc:
-        raise HTTPException(502, f"geometry_parameter_packs insert failed: {exc}")
+        raise HTTPException(502, f'geometry_parameter_packs insert failed: {exc}')
     clear_cache()
     if isinstance(rows, list) and rows:
         pack = rows[0]
@@ -3314,7 +3403,7 @@ def yt_smoke_seed_pack(body: Dict[str, Any] = Body({})):
 
 
 @app.post('/yt/cgp-build')
-def yt_cgp_build(body: Dict[str, Any] = Body(...)):
+def yt_cgp_build(body: dict[str, Any] = Body(...)):
     """Build a Compressed Geometry Proxy (CGP) from provided chunks.
 
     Creates a Geometry Bus CHIT structure from pre-segmented chunks without
@@ -3346,11 +3435,11 @@ def yt_cgp_build(body: Dict[str, Any] = Body(...)):
 
 
 def _upsert_chunks_to_hirag(
-    chunks: List[Dict[str, Any]],
+    chunks: list[dict[str, Any]],
     *,
     lexical: bool,
     batch_size: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     payload_template = {'index_lexical': lexical}
     total_upserted = 0
     lexical_indexed = False
@@ -3361,7 +3450,7 @@ def _upsert_chunks_to_hirag(
         payload['items'] = batch
         payload['ensure_collection'] = idx == 0
         r = requests.post(
-            f"{HIRAG_URL}/hirag/upsert-batch",
+            f'{HIRAG_URL}/hirag/upsert-batch',
             headers={'content-type': 'application/json'},
             data=json.dumps(payload),
             timeout=(10, 600),
@@ -3377,7 +3466,7 @@ def _upsert_chunks_to_hirag(
     }
 
 
-def _geometry_url_candidates() -> List[str]:
+def _geometry_url_candidates() -> list[str]:
     """Build list of candidate URLs for geometry/CHIT event submission.
 
     Resolution priority:
@@ -3389,9 +3478,9 @@ def _geometry_url_candidates() -> List[str]:
     Returns:
         List of candidate URLs to try, in priority order.
     """
-    candidates: List[str] = []
+    candidates: list[str] = []
 
-    def _push(url: Optional[str]) -> None:
+    def _push(url: str | None) -> None:
         if not url:
             return
         cleaned = url.rstrip('/')
@@ -3399,70 +3488,70 @@ def _geometry_url_candidates() -> List[str]:
             candidates.append(cleaned)
 
     # Environment variables (explicit override)
-    base = os.environ.get("HIRAG_URL")
+    base = os.environ.get('HIRAG_URL')
     _push(base)
-    _push(os.environ.get("HIRAG_GPU_URL"))
-    _push(os.environ.get("HIRAG_CPU_URL"))
+    _push(os.environ.get('HIRAG_GPU_URL'))
+    _push(os.environ.get('HIRAG_CPU_URL'))
 
     # Service registry fallback (if no env var set)
     if not base and SERVICE_REGISTRY_AVAILABLE:
-        _push(get_service_url_sync("hirag-v2", default_port=8086))
+        _push(get_service_url_sync('hirag-v2', default_port=8086))
         # Try GPU variant
-        _push(get_service_url_sync("hirag-v2-gpu", default_port=8087))
+        _push(get_service_url_sync('hirag-v2-gpu', default_port=8087))
 
     # Derive common fallbacks from the primary base URL (CPU ↔ GPU, port swap, host bridge).
-    derived_hosts: List[str] = []
+    derived_hosts: list[str] = []
     if base:
         parsed = urlparse(base)
-        host = parsed.hostname or ""
+        host = parsed.hostname or ''
         port = parsed.port
-        scheme = parsed.scheme or "http"
+        scheme = parsed.scheme or 'http'
 
         if host:
-            if "hi-rag-gateway-v2" in host and "-gpu" not in host:
-                derived_hosts.append(host.replace("hi-rag-gateway-v2", "hi-rag-gateway-v2-gpu"))
-            if "hi-rag-gateway-v2-gpu" in host:
-                derived_hosts.append(host.replace("hi-rag-gateway-v2-gpu", "hi-rag-gateway-v2"))
+            if 'hi-rag-gateway-v2' in host and '-gpu' not in host:
+                derived_hosts.append(host.replace('hi-rag-gateway-v2', 'hi-rag-gateway-v2-gpu'))
+            if 'hi-rag-gateway-v2-gpu' in host:
+                derived_hosts.append(host.replace('hi-rag-gateway-v2-gpu', 'hi-rag-gateway-v2'))
         if port == 8086:
-            derived_hosts.append(f"{host}:8087" if host else "localhost:8087")
+            derived_hosts.append(f'{host}:8087' if host else 'localhost:8087')
         elif port == 8087:
-            derived_hosts.append(f"{host}:8086" if host else "localhost:8086")
+            derived_hosts.append(f'{host}:8086' if host else 'localhost:8086')
 
         for derived in derived_hosts:
             if not derived:
                 continue
-            if ":" in derived:
-                d_host, d_port = derived.split(":", 1)
+            if ':' in derived:
+                _, d_port = derived.split(':', 1)
             else:
-                d_host, d_port = derived, ""
+                d_port = ''
             new_netloc = derived
             if not d_port:
-                new_netloc = f"{derived}:8086"
+                new_netloc = f'{derived}:8086'
             derived_url = urlunparse((scheme, new_netloc, '', '', '', ''))
             _push(derived_url)
 
     # Default fallbacks for typical local setups.
-    _push("http://hi-rag-gateway-v2-gpu:8086")
-    _push("http://hi-rag-gateway-v2:8086")
-    _push("http://host.docker.internal:8087")
-    _push("http://host.docker.internal:8086")
+    _push('http://hi-rag-gateway-v2-gpu:8086')
+    _push('http://hi-rag-gateway-v2:8086')
+    _push('http://host.docker.internal:8087')
+    _push('http://host.docker.internal:8086')
 
     return candidates
 
 
 def _emit_geometry_event(
     video_id: str,
-    chunks: List[Dict[str, Any]],
-    title: Optional[str],
+    chunks: list[dict[str, Any]],
+    title: str | None,
     namespace: str,
 ) -> None:
     cgp = _build_cgp(video_id, chunks, title, namespace)
     payload = {'type': 'geometry.cgp.v1', 'data': cgp}
-    last_error: Optional[Exception] = None
+    last_error: Exception | None = None
     for base in _geometry_url_candidates():
         try:
             r2 = requests.post(
-                f"{base}/geometry/event",
+                f'{base}/geometry/event',
                 headers={'content-type': 'application/json'},
                 data=json.dumps(payload),
                 timeout=60,
@@ -3470,48 +3559,48 @@ def _emit_geometry_event(
             r2.raise_for_status()
             if base != (HIRAG_URL.rstrip('/') if HIRAG_URL else None):
                 logger.info(
-                    "geometry_event_routed",
+                    'geometry_event_routed',
                     extra={
-                        "event": "geometry_event_routed",
-                        "video_id": video_id,
-                        "target": base,
+                        'event': 'geometry_event_routed',
+                        'video_id': video_id,
+                        'target': base,
                     },
                 )
             return
         except Exception as exc:  # pylint: disable=broad-except
             last_error = exc
             logger.warning(
-                "geometry_event_post_failed",
+                'geometry_event_post_failed',
                 extra={
-                    "event": "geometry_event_post_failed",
-                    "video_id": video_id,
-                    "target": base,
-                    "error": str(exc),
+                    'event': 'geometry_event_post_failed',
+                    'video_id': video_id,
+                    'target': base,
+                    'error': str(exc),
                 },
             )
             continue
-    raise HTTPException(502, f"Failed to publish geometry event: {last_error}")
+    raise HTTPException(502, f'Failed to publish geometry event: {last_error}')
 
 
 def _emit_async_job(
     job_id: str,
     video_id: str,
     namespace: str,
-    title: Optional[str],
-    tuned: Optional[Dict[str, Any]],
-    chunks: List[Dict[str, Any]],
+    title: str | None,
+    tuned: dict[str, Any] | None,
+    chunks: list[dict[str, Any]],
     lexical: bool,
     batch_size: int,
 ) -> None:
     logger.info(
-        "yt_emit_async_started",
+        'yt_emit_async_started',
         extra={
-            "event": "yt_emit_async_started",
-            "job_id": job_id,
-            "video_id": video_id,
-            "namespace": namespace,
-            "chunks": len(chunks),
-            "lexical": lexical,
+            'event': 'yt_emit_async_started',
+            'job_id': job_id,
+            'video_id': video_id,
+            'namespace': namespace,
+            'chunks': len(chunks),
+            'lexical': lexical,
         },
     )
     try:
@@ -3519,43 +3608,44 @@ def _emit_async_job(
         _emit_geometry_event(video_id, chunks, title, namespace)
         _update_emit_job(
             job_id,
-            status="completed",
+            status='completed',
             finished_at=_utc_now(),
             upserted=up.get('upserted'),
             lexical_indexed=up.get('lexical_indexed'),
             profile=(tuned or {}).get('profile') if tuned else None,
         )
         logger.info(
-            "yt_emit_async_completed",
+            'yt_emit_async_completed',
             extra={
-                "event": "yt_emit_async_completed",
-                "job_id": job_id,
-                "video_id": video_id,
-                "namespace": namespace,
-                "upserted": up.get('upserted'),
-                "lexical_indexed": up.get('lexical_indexed'),
+                'event': 'yt_emit_async_completed',
+                'job_id': job_id,
+                'video_id': video_id,
+                'namespace': namespace,
+                'upserted': up.get('upserted'),
+                'lexical_indexed': up.get('lexical_indexed'),
             },
         )
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.exception(
-            "yt_emit_async_failed",
+            'yt_emit_async_failed',
             extra={
-                "event": "yt_emit_async_failed",
-                "job_id": job_id,
-                "video_id": video_id,
-                "namespace": namespace,
-                "error": str(exc),
+                'event': 'yt_emit_async_failed',
+                'job_id': job_id,
+                'video_id': video_id,
+                'namespace': namespace,
+                'error': str(exc),
             },
         )
         _update_emit_job(
             job_id,
-            status="failed",
+            status='failed',
             finished_at=_utc_now(),
             error=str(exc),
         )
 
+
 @app.post('/yt/emit')
-def yt_emit(background_tasks: BackgroundTasks, body: Dict[str, Any] = Body(...)):
+def yt_emit(background_tasks: BackgroundTasks, body: dict[str, Any] = Body(...)):
     """Emit video transcript to Geometry Bus and Hi-RAG for knowledge indexing.
 
     Segments transcript, builds CGP (Compressed Geometry Proxy), and upserts
@@ -3612,8 +3702,8 @@ def yt_emit(background_tasks: BackgroundTasks, body: Dict[str, Any] = Body(...))
             pass
     if not (text or segs):
         raise HTTPException(404, 'transcript not found; run /yt/transcript first')
-    doc_id = f"yt:{vid}"
-    tuned: Optional[Dict[str, Any]] = None
+    doc_id = f'yt:{vid}'
+    tuned: dict[str, Any] | None = None
     if segs and YT_SEG_AUTOTUNE:
         tuned = _auto_tune_segment_params(segs, text)
         chunks = _segment_from_whisper_segments(
@@ -3712,12 +3802,12 @@ def yt_emit(background_tasks: BackgroundTasks, body: Dict[str, Any] = Body(...))
     try:
         up = _upsert_chunks_to_hirag(chunks, lexical=lexical_enabled, batch_size=batch_size)
     except Exception as exc:
-        raise HTTPException(502, f"upsert-batch failed: {exc}")
+        raise HTTPException(502, f'upsert-batch failed: {exc}')
 
     try:
         _emit_geometry_event(vid, chunks, title, ns)
     except Exception as exc:
-        raise HTTPException(502, f"CGP emit failed: {exc}")
+        raise HTTPException(502, f'CGP emit failed: {exc}')
 
     return {
         'ok': True,
@@ -3757,79 +3847,80 @@ def yt_emit_status(job_id: str):
         raise HTTPException(404, 'job not found')
     return {'ok': True, 'job': job}
 
+
 @app.post('/yt/search')
-def yt_search(body: Dict[str,Any] = Body(...)):
+def yt_search(body: dict[str, Any] = Body(...)):
     """Semantic search across YouTube transcript corpus via Hi-RAG v2.
-    
+
     Args:
         query: Search query string
         limit: Maximum number of videos to return (default 10)
         threshold: Minimum similarity score 0-1 (default 0.70)
         namespace: Indexer namespace (default from env)
-    
+
     Returns:
         {ok, query, results: [{video_id, title, url, similarity, excerpt, timestamp}], total}
     """
     query = body.get('query')
     if not query:
         raise HTTPException(400, 'query required')
-    
+
     limit = int(body.get('limit', 10))
     threshold = float(body.get('threshold', 0.70))
     namespace = body.get('namespace', DEFAULT_NAMESPACE)
-    
+
     # Query hi-rag for YouTube chunks (ask for more to account for filtering)
     try:
         payload = {'query': query, 'k': limit * 3, 'namespace': namespace}
-        r = requests.post(f"{HIRAG_URL}/hirag/query", json=payload, timeout=30)
+        r = requests.post(f'{HIRAG_URL}/hirag/query', json=payload, timeout=30)
         r.raise_for_status()
         chunks = r.json().get('results', [])
     except Exception as e:
-        raise HTTPException(502, f"hi-rag query failed: {e}")
-    
+        raise HTTPException(502, f'hi-rag query failed: {e}')
+
     # Filter for YouTube content and deduplicate by video_id
     yt_results = []
     seen_videos = set()
-    
+
     for chunk in chunks:
         doc_id = chunk.get('doc_id', '')
         if not doc_id.startswith('yt:'):
             continue
-        
+
         video_id = doc_id.split(':')[1] if ':' in doc_id else doc_id
         if not _SAFE_VID_RE.match(video_id):
             continue
         if video_id in seen_videos:
             continue
-        
+
         score = chunk.get('score', 0.0)
         if score < threshold:
             continue
-        
+
         seen_videos.add(video_id)
-        
+
         # Fetch video metadata from Supabase
         try:
             vid_rows = supa_get('videos', {'video_id': video_id}) or []
             title = vid_rows[0].get('title') if vid_rows else video_id
         except Exception:
             title = video_id
-        
+
         yt_results.append({
             'video_id': video_id,
             'title': title,
-            'url': f"https://youtube.com/watch?v={video_id}",
+            'url': f'https://youtube.com/watch?v={video_id}',
             'similarity': round(score, 4),
             'excerpt': chunk.get('text', '')[:300],
-            'timestamp': chunk.get('payload', {}).get('t_start')
+            'timestamp': chunk.get('payload', {}).get('t_start'),
         })
-        
+
         if len(yt_results) >= limit:
             break
-    
+
     return {
         'ok': True,
         'query': query,
         'results': yt_results,
-        'total': len(yt_results)
+        'total': len(yt_results),
     }
