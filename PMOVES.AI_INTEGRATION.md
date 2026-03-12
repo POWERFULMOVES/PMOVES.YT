@@ -47,6 +47,8 @@ Core dependencies:
 - ffmpeg-whisper for transcript generation
 - NATS for event publication
 - channel-monitor for queue/status integration
+- Invidious + companion for throttling/SABR fallback
+- Jellyfin backfill via `/yt/search`
 
 ## Production notes
 
@@ -59,5 +61,6 @@ Core dependencies:
 ```bash
 curl http://localhost:8077/healthz
 curl http://localhost:8077/yt/docs/catalog
+curl -X POST http://localhost:8077/yt/docs/sync -H 'X-API-Key: YOUR_API_KEY'
 python -m pytest -q pmoves_yt_service/tests
 ```

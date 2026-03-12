@@ -54,11 +54,7 @@ def _capture_cmd(args: list[str]) -> str | None:
 
 
 def collect_yt_dlp_docs() -> dict[str, object]:
-    version = getattr(yt_dlp, 'version', None)
-    if isinstance(version, str):
-        ver = version
-    else:
-        ver = getattr(yt_dlp, '__version__', None) or YT_DLP_VERSION or 'unknown'
+    ver = getattr(yt_dlp, '__version__', None) or YT_DLP_VERSION or 'unknown'
     docs: dict[str, object] = {
         'version': ver,
         'ts': datetime.now(timezone.utc).isoformat(),
@@ -77,7 +73,7 @@ def collect_yt_dlp_docs() -> dict[str, object]:
 def sync_to_supabase(docs: dict[str, object]) -> dict[str, object]:
     keys = _candidate_keys()
     if not keys:
-        raise RuntimeError('SUPABASE_SERVICE_ROLE_KEY (or equivalent) is required')
+        raise RuntimeError('SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SERVICE_KEY, or SUPABASE_KEY is required')
     tool = 'yt-dlp'
     ver = docs.get('version') or 'unknown'
     rows = []
@@ -108,6 +104,7 @@ def sync_to_supabase(docs: dict[str, object]) -> dict[str, object]:
     for target in targets:
         missing_relation = False
         transport_error = False
+        auth_failures = 0
         for key in keys:
             headers = {
                 'apikey': key,
@@ -134,11 +131,19 @@ def sync_to_supabase(docs: dict[str, object]) -> dict[str, object]:
             # JWT/key mismatch can happen when layered env files contain stale aliases.
             # Continue trying available keys before failing hard.
             if r.status_code in (401, 403):
+                auth_failures += 1
                 continue
             # Missing schema/table: move to next target strategy.
             if r.status_code in (404, 406):
                 missing_relation = True
             break
+        if auth_failures == len(keys):
+            logger.error(
+                'yt-dlp docs sync auth failed: target=%s schema=%s error=%s',
+                target['url'],
+                target.get('schema'),
+                last_error,
+            )
         if missing_relation or transport_error:
             continue
 

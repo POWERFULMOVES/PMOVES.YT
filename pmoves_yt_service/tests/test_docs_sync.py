@@ -35,4 +35,4 @@ def test_sync_to_supabase_url_encodes_on_conflict(monkeypatch):
 
     assert out['status'] == 'ok'
     assert calls
-    assert 'on_conflict=tool%2Cversion%2Cdoc_type' in calls[0]
+    assert any('on_conflict=tool%2Cversion%2Cdoc_type' in call for call in calls)

@@ -30,5 +30,12 @@ Primary validation:
 ```bash
 curl http://localhost:8077/healthz
 curl http://localhost:8077/yt/docs/catalog
+ruff check pmoves_yt_service
 python -m pytest -q pmoves_yt_service/tests
 ```
+
+Downloader/runtime notes:
+- Default submodule client chain: `YT_PLAYER_CLIENT=default,mweb`
+- Production root compose may override that to `web_safari` with an aligned Safari UA
+- Prefer `BGUTIL_HTTP_BASE_URL` or companion-backed tokens over static `YT_PO_TOKEN_VALUE`
+- If `YT_ENABLE_PO_TOKEN=true`, tokens must follow yt-dlp's `client.context+token` contract

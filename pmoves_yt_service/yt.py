@@ -392,6 +392,21 @@ def _parse_bool(value: Optional[str]) -> Optional[bool]:
         return False
     return None
 
+
+def _parse_csv_env_list(value: Optional[str], *, default: list[str]) -> list[str]:
+    """Parse a comma-delimited env var into a de-duplicated ordered list."""
+    if not value or not value.strip():
+        return list(default)
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in value.split(","):
+        cleaned = item.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        out.append(cleaned)
+    return out or list(default)
+
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT") or os.environ.get("S3_ENDPOINT") or "minio:9000"
 MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY") or os.environ.get("AWS_ACCESS_KEY_ID", "")
 MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
@@ -494,9 +509,11 @@ except ValueError:
 # Auto-tune segmentation thresholds based on content profile
 YT_SEG_AUTOTUNE = os.environ.get("YT_SEG_AUTOTUNE", "true").lower() == "true"
 
-DEFAULT_ANDROID_UA = "Mozilla/5.0 (Linux; Android 12; Pixel 5 Build/SP2A.220405.004; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/101.0.4951.41 Mobile Safari/537.36"
-YT_PLAYER_CLIENT = (os.environ.get("YT_PLAYER_CLIENT") or "android").strip()
-YT_USER_AGENT = os.environ.get("YT_USER_AGENT") or DEFAULT_ANDROID_UA
+YT_PLAYER_CLIENTS = _parse_csv_env_list(
+    os.environ.get("YT_PLAYER_CLIENT"),
+    default=["default", "mweb"],
+)
+YT_USER_AGENT = (os.environ.get("YT_USER_AGENT") or "").strip()
 YT_FORCE_IPV4 = os.environ.get("YT_FORCE_IPV4", "true").lower() == "true"
 try:
     YT_EXTRACTOR_RETRIES = int(os.environ.get("YT_EXTRACTOR_RETRIES", "2"))
@@ -509,6 +526,7 @@ INVIDIOUS_FALLBACK_FORMAT = os.environ.get("INVIDIOUS_FALLBACK_FORMAT", "video/m
 YT_ENABLE_PO_TOKEN = os.environ.get("YT_ENABLE_PO_TOKEN", "false").lower() == "true"
 YT_COMPANION_ENABLED = os.environ.get("YT_COMPANION_ENABLED", "true").lower() in {"true", "1", "yes", "y"}
 YT_PO_TOKEN_VALUE = os.environ.get("YT_PO_TOKEN_VALUE")
+YT_PO_TOKEN_CONTEXT = (os.environ.get("YT_PO_TOKEN_CONTEXT") or "").strip()
 YT_PO_TOKEN_ITAG = os.environ.get("YT_PO_TOKEN_ITAG", "18")
 try:
     YT_UPSERT_BATCH_SIZE = max(1, int(os.environ.get("YT_UPSERT_BATCH_SIZE", "200")))
@@ -667,14 +685,17 @@ def _with_ytdlp_defaults(opts: Dict[str, Any], *, po_token: Optional[str] = None
     extractor_args = dict(merged.get('extractor_args') or {})
     youtube_args = dict(extractor_args.get('youtube') or {})
     effective_po_token = po_token or (YT_PO_TOKEN_VALUE if YT_ENABLE_PO_TOKEN else None)
+    client_candidates = list(youtube_args.get('player_client') or [])
+    for client in YT_PLAYER_CLIENTS:
+        if client not in client_candidates:
+            client_candidates.append(client)
     if effective_po_token:
+        effective_po_token = _normalize_po_token(effective_po_token, client_candidates)
         po_token_values = list(youtube_args.get('po_token') or [])
         if effective_po_token not in po_token_values:
             youtube_args['po_token'] = [effective_po_token] + po_token_values
-    if YT_PLAYER_CLIENT:
-        clients = list(youtube_args.get('player_client') or [])
-        if YT_PLAYER_CLIENT not in clients:
-            youtube_args['player_client'] = [YT_PLAYER_CLIENT] + clients
+    if client_candidates:
+        youtube_args['player_client'] = client_candidates
     if youtube_args:
         extractor_args['youtube'] = youtube_args
     bgutil_args = dict(extractor_args.get('youtubepot-bgutilhttp') or {})
@@ -707,6 +728,35 @@ def _with_ytdlp_defaults(opts: Dict[str, Any], *, po_token: Optional[str] = None
     merged.setdefault('noplaylist', True)
     merged.setdefault('hls_prefer_native', True)
     return merged
+
+
+def _infer_po_token_context(player_clients: List[str]) -> str:
+    """Infer the most relevant yt-dlp PO token context from configured clients."""
+    if YT_PO_TOKEN_CONTEXT:
+        return YT_PO_TOKEN_CONTEXT
+    for client in player_clients:
+        normalized = client.strip()
+        if not normalized or normalized.startswith("-") or normalized == "default":
+            continue
+        return f"{normalized}.gvs"
+    return "mweb.gvs"
+
+
+def _normalize_po_token(token: str, player_clients: List[str]) -> str:
+    """Return PO tokens in yt-dlp's CLIENT.CONTEXT+TOKEN format."""
+    raw = token.strip()
+    if not raw:
+        return raw
+    if "+" not in raw:
+        return f"{_infer_po_token_context(player_clients)}+{raw}"
+    prefix, suffix = raw.split("+", 1)
+    prefix = prefix.strip()
+    suffix = suffix.strip()
+    if not suffix:
+        return raw
+    if "." in prefix:
+        return f"{prefix}+{suffix}"
+    return f"{_infer_po_token_context(player_clients)}+{suffix}"
 
 def s3_client():
     """Create and configure a boto3 S3 client for MinIO/S3 operations.
@@ -1321,7 +1371,7 @@ def _fetch_po_token_from_companion(video_id: str) -> Optional[str]:
                         "po_token_fetched",
                         extra={"event": "po_token_fetched", "video_id": video_id},
                     )
-                    return f"WEB+{token}"
+                    return token
         else:
             logger.warning(
                 "po_token_unexpected_status",

@@ -9,6 +9,7 @@ from typing import Any
 import yt_dlp
 from yt_dlp.extractor import list_extractors
 from yt_dlp.options import create_parser
+from yt_dlp.version import __version__ as YT_DLP_VERSION
 
 
 def _json_safe(value: Any) -> Any:
@@ -28,14 +29,13 @@ def _json_safe(value: Any) -> Any:
 
 @lru_cache(maxsize=1)
 def version_info() -> dict[str, Any]:
-    version_mod = getattr(yt_dlp, 'version', None)
-    version = getattr(version_mod, '__version__', None) or getattr(yt_dlp, '__version__', None) or 'unknown'
+    version = getattr(yt_dlp, '__version__', None) or YT_DLP_VERSION or 'unknown'
     return {'yt_dlp_version': version}
 
 
 @lru_cache(maxsize=1)
 def extractor_count() -> int:
-    return sum(1 for _ in list_extractors())
+    return len(list_extractors())
 
 
 @lru_cache(maxsize=1)

@@ -22,8 +22,16 @@ YouTube ingest helper that emits CHIT geometry after analysis.
 ## Testing
 
 - Unit suite: `python -m pytest pmoves/services/pmoves-yt/tests`
-- Async playlist pacing coverage (`tests/test_rate_limit.py::test_playlist_rate_limit_sleep`) now relies on `pytest-asyncio` for event loop orchestration. The dependency ships in `services/pmoves-yt/requirements.txt`, so re-run `python -m pip install -r services/pmoves-yt/requirements.txt` after pulling this change to keep the test harness green.
+- Overlay lint: `ruff check pmoves_yt_service`
 - Offline bundle refresh: `make vendor-httpx` (requires [uv](https://github.com/astral-sh/uv)) rebuilds `pmoves/vendor/python/` so helper scripts like `pmoves/scripts/backfill_jellyfin_metadata.py` can import `httpx` without pip.
+
+## Modern downloader path
+
+- Default PMOVES.YT client selection now follows `default,mweb` unless `YT_PLAYER_CLIENT` overrides it.
+- Prefer bgutil POT provider wiring (`BGUTIL_HTTP_BASE_URL`) over static `YT_PO_TOKEN_VALUE`.
+- If `YT_ENABLE_PO_TOKEN=true`, PMOVES.YT normalizes raw or legacy tokens into yt-dlp's current `client.context+token` format before applying extractor args.
+- Root `PMOVES.AI` compose intentionally overrides the runtime with `web_safari` + a Safari UA for the current production stack. Keep submodule and root docs aligned when changing that override.
+- Invidious Companion remains the first fallback for throttled YouTube downloads when configured; plain Invidious stays the secondary fallback.
 
 ## Resilient Playlist Ingest (2025-10)
 
