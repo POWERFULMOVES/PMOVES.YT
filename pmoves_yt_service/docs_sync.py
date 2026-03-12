@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 SUPA = (
     os.environ.get('SUPABASE_REST_URL')
     or os.environ.get('SUPA_REST_URL')
+    or os.environ.get('SUPABASE_URL')
     or 'http://postgrest:3000'
 ).rstrip('/')
 
