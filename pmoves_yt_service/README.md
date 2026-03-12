@@ -33,6 +33,20 @@ YouTube ingest helper that emits CHIT geometry after analysis.
 - Root `PMOVES.AI` compose intentionally overrides the runtime with `web_safari` + a Safari UA for the current production stack. Keep submodule and root docs aligned when changing that override.
 - Invidious Companion remains the first fallback for throttled YouTube downloads when configured; plain Invidious stays the secondary fallback.
 
+## Read vs write control plane
+
+- PMOVES.YT's current production strength is read/ingest:
+  - yt-dlp for metadata/media extraction
+  - companion/Invidious for fallback download paths
+  - Supabase + NATS + Jellyfin handoff for downstream PMOVES workflows
+- PMOVES.YT is not yet the owned-channel write/control plane:
+  - playlist mutation
+  - comment/reply actions
+  - broader YouTube channel management
+- Those creator-control actions should be implemented through the YouTube Data API with separate
+  Google credentials and explicit approval/audit hooks, rather than trying to extend yt-dlp for
+  write operations it is not designed to own.
+
 ## Resilient Playlist Ingest (2025-10)
 
 - `/yt/playlist` now runs downloads concurrently (bounded by `YT_CONCURRENCY`) with
