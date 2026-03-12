@@ -55,6 +55,8 @@ YouTube ingest helper that emits CHIT geometry after analysis.
   - preview or execute adding a video to a playlist
 - `POST /yt/control/playlist/create`
   - preview or execute creating a playlist
+- `POST /yt/control/playlist/update`
+  - preview or execute updating playlist title, description, or privacy
 - `POST /yt/control/playlist/remove`
   - preview or execute removing an item from a playlist
 - `POST /yt/control/playlist/reorder`

@@ -102,6 +102,45 @@ def create_playlist(
     return _check_response(response, 'create_playlist')
 
 
+def update_playlist(
+    *,
+    access_token: str,
+    playlist_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    privacy_status: str | None = None,
+    default_language: str | None = None,
+) -> dict[str, Any]:
+    snippet: dict[str, Any] = {}
+    status: dict[str, Any] = {}
+    if title is not None:
+        snippet['title'] = title
+    if description is not None:
+        snippet['description'] = description
+    if default_language is not None:
+        snippet['defaultLanguage'] = default_language
+    if privacy_status is not None:
+        status['privacyStatus'] = privacy_status
+    if not snippet and not status:
+        raise YouTubeControlError('update_playlist requires at least one mutable field')
+    payload: dict[str, Any] = {'id': playlist_id}
+    parts: list[str] = []
+    if snippet:
+        payload['snippet'] = snippet
+        parts.append('snippet')
+    if status:
+        payload['status'] = status
+        parts.append('status')
+    response = requests.put(
+        f'{YOUTUBE_API_BASE}/playlists',
+        params={'part': ','.join(parts)},
+        headers={'Authorization': f'Bearer {access_token}'},
+        json=payload,
+        timeout=30,
+    )
+    return _check_response(response, 'update_playlist')
+
+
 def delete_playlist_item(
     *,
     access_token: str,

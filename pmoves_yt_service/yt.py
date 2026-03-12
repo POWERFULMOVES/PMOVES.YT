@@ -400,6 +400,7 @@ try:
         insert_comment,
         insert_playlist_item,
         refresh_access_token,
+        update_playlist,
         update_playlist_item_position,
     )
 except ImportError:  # pragma: no cover
@@ -410,6 +411,7 @@ except ImportError:  # pragma: no cover
         insert_comment,
         insert_playlist_item,
         refresh_access_token,
+        update_playlist,
         update_playlist_item_position,
     )
 try:
@@ -990,6 +992,14 @@ class PlaylistCreateRequest(YouTubeControlRequest):
     default_language: str | None = Field(None, description='Optional default language code')
 
 
+class PlaylistUpdateRequest(YouTubeControlRequest):
+    playlist_id: str = Field(..., description='Target YouTube playlist ID')
+    title: str | None = Field(None, description='Updated playlist title')
+    description: str | None = Field(None, description='Updated playlist description')
+    privacy_status: str | None = Field(None, description='Updated playlist privacy status')
+    default_language: str | None = Field(None, description='Updated playlist default language code')
+
+
 class PlaylistItemRemoveRequest(YouTubeControlRequest):
     playlist_item_id: str = Field(..., description='Playlist item ID to remove')
     playlist_id: str | None = Field(None, description='Optional playlist ID for audit context')
@@ -1017,6 +1027,7 @@ def _control_plane_status() -> dict[str, Any]:
         'audit_table': 'pmoves_core.youtube_control_actions',
         'supported_actions': [
             'playlist_create',
+            'playlist_update',
             'playlist_add',
             'playlist_remove',
             'playlist_reorder',
@@ -1112,6 +1123,22 @@ def _execute_playlist_create(body: PlaylistCreateRequest) -> dict[str, Any]:
     )
     return create_playlist(
         access_token=access_token,
+        title=body.title,
+        description=body.description,
+        privacy_status=body.privacy_status,
+        default_language=body.default_language,
+    )
+
+
+def _execute_playlist_update(body: PlaylistUpdateRequest) -> dict[str, Any]:
+    access_token = refresh_access_token(
+        client_id=YT_GOOGLE_CLIENT_ID,
+        client_secret=YT_GOOGLE_CLIENT_SECRET,
+        refresh_token=_resolve_control_refresh_token(body.refresh_token),
+    )
+    return update_playlist(
+        access_token=access_token,
+        playlist_id=body.playlist_id,
         title=body.title,
         description=body.description,
         privacy_status=body.privacy_status,
@@ -3405,6 +3432,63 @@ async def yt_control_playlist_create(
     _record_control_action(
         action_id=preview['action_id'],
         action='playlist_create',
+        status='executed',
+        body=body,
+        details=preview['details'],
+        result=result,
+    )
+    _publish_event('creator.youtube.control.executed.v1', payload)
+    return {'status': 'executed', **payload}
+
+
+@app.post('/yt/control/playlist/update')
+async def yt_control_playlist_update(
+    body: PlaylistUpdateRequest,
+    _: None = Depends(require_control_plane_access),
+) -> dict[str, Any]:
+    """Preview or execute updating owned playlist metadata via YouTube Data API."""
+    _ensure_control_execute_allowed(body.execute, body.approved_by)
+    if not any(value is not None for value in (body.title, body.description, body.privacy_status, body.default_language)):
+        raise HTTPException(status_code=400, detail='playlist_update requires at least one mutable field')
+    preview = _control_preview(
+        'playlist_update',
+        body,
+        {
+            'playlist_id': body.playlist_id,
+            'title': body.title,
+            'description_preview': body.description[:160] if isinstance(body.description, str) else None,
+            'privacy_status': body.privacy_status,
+            'default_language': body.default_language,
+        },
+    )
+    if not body.execute:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='playlist_update',
+            status='preview',
+            body=body,
+            details=preview['details'],
+        )
+        return {'status': 'preview', **preview}
+    try:
+        result = await asyncio.to_thread(_execute_playlist_update, body)
+    except YouTubeControlError as exc:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='playlist_update',
+            status='error',
+            body=body,
+            details=preview['details'],
+            error=str(exc),
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    payload = {
+        **preview,
+        'result': result,
+    }
+    _record_control_action(
+        action_id=preview['action_id'],
+        action='playlist_update',
         status='executed',
         body=body,
         details=preview['details'],
