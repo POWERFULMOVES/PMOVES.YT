@@ -466,8 +466,11 @@ CHANNEL_MONITOR_STATUS_SECRET = os.environ.get('CHANNEL_MONITOR_STATUS_SECRET')
 # Summarization (Gemma) configuration
 YT_SUMMARY_PROVIDER = os.environ.get('YT_SUMMARY_PROVIDER', 'ollama')  # ollama|hf
 OLLAMA_URL = os.environ.get('OLLAMA_URL', 'http://localhost:11434')
-YT_GEMMA_MODEL = os.environ.get('YT_GEMMA_MODEL', 'gemma2:9b-instruct')
-HF_GEMMA_MODEL = os.environ.get('HF_GEMMA_MODEL', 'google/gemma-2-9b-it')
+YT_SUMMARY_ROLE = os.environ.get('YT_SUMMARY_ROLE', 'creator_summary')
+YT_SUMMARY_OLLAMA_ALIAS = os.environ.get('YT_SUMMARY_OLLAMA_ALIAS', YT_SUMMARY_ROLE)
+YT_SUMMARY_HF_ALIAS = os.environ.get('YT_SUMMARY_HF_ALIAS', YT_SUMMARY_ROLE)
+YT_SUMMARY_OLLAMA_MODEL = os.environ.get('YT_SUMMARY_OLLAMA_MODEL') or os.environ.get('YT_GEMMA_MODEL', 'gemma2:9b-instruct')
+YT_SUMMARY_HF_MODEL = os.environ.get('YT_SUMMARY_HF_MODEL') or os.environ.get('HF_GEMMA_MODEL', 'google/gemma-2-9b-it')
 HF_USE_GPU = os.environ.get('HF_USE_GPU', 'false').lower() == 'true'
 HF_TOKEN = os.environ.get('HF_TOKEN')
 
@@ -2773,15 +2776,40 @@ async def yt_channel(body: dict[str, Any] = Body(...)):
 # -------------------- Gemma Summarization --------------------
 
 
-def _summarize_ollama(text: str, style: str) -> str:
-    """Summarize text using Ollama API with Gemma model.
+def _resolve_summary_runtime(provider: str | None) -> dict[str, str]:
+    """Resolve summary provider and model details.
+
+    This is a compatibility bridge toward the model-fabric contract:
+    the service exposes stable role/alias metadata now, while still allowing
+    direct model IDs via env fallback until registry-backed resolution becomes
+    the default.
+    """
+    selected_provider = (provider or YT_SUMMARY_PROVIDER or 'ollama').strip().lower()
+    if selected_provider == 'hf':
+        return {
+            'provider': 'hf',
+            'role': YT_SUMMARY_ROLE,
+            'model_alias': YT_SUMMARY_HF_ALIAS,
+            'model_id': YT_SUMMARY_HF_MODEL,
+        }
+    return {
+        'provider': 'ollama',
+        'role': YT_SUMMARY_ROLE,
+        'model_alias': YT_SUMMARY_OLLAMA_ALIAS,
+        'model_id': YT_SUMMARY_OLLAMA_MODEL,
+    }
+
+
+def _summarize_ollama(text: str, style: str, model_id: str) -> str:
+    """Summarize text using Ollama API with a configured local model.
 
     Sends transcript text to Ollama local API for summarization using
-    the configured Gemma model.
+    the resolved summary model.
 
     Args:
         text: Transcript text to summarize (truncated to 12000 chars).
         style: Summary style ('brief', 'detailed', etc.).
+        model_id: Concrete model id to call through Ollama.
 
     Returns:
         Generated summary text.
@@ -2791,7 +2819,7 @@ def _summarize_ollama(text: str, style: str) -> str:
     """
     prompt = f'You are a skilled video summarizer. Style={style}. Summarize the transcript below succinctly.\n\nTranscript:\n{text[:12000]}'
     try:
-        r = requests.post(f'{OLLAMA_URL}/api/generate', json={'model': YT_GEMMA_MODEL, 'prompt': prompt, 'stream': False}, timeout=180)
+        r = requests.post(f'{OLLAMA_URL}/api/generate', json={'model': model_id, 'prompt': prompt, 'stream': False}, timeout=180)
         r.raise_for_status()
         j = r.json()
         return j.get('response') or j.get('data') or ''
@@ -2799,15 +2827,15 @@ def _summarize_ollama(text: str, style: str) -> str:
         raise HTTPException(502, f'Ollama summarization failed: {e}')
 
 
-def _summarize_hf(text: str, style: str) -> str:
-    """Summarize text using HuggingFace Transformers with Gemma model.
+def _summarize_hf(text: str, style: str, model_id: str) -> str:
+    """Summarize text using HuggingFace Transformers with a configured model.
 
-    Uses local Gemma model via Transformers library for summarization.
-    Requires GPU for acceptable performance with 9B parameter model.
+    Uses a local model via Transformers library for summarization.
 
     Args:
         text: Transcript text to summarize (truncated to 8000 chars).
         style: Summary style ('brief', 'detailed', etc.).
+        model_id: Concrete HuggingFace model id.
 
     Returns:
         Generated summary text.
@@ -2822,8 +2850,8 @@ def _summarize_hf(text: str, style: str) -> str:
     except Exception:
         raise HTTPException(500, 'HF Transformers not installed; use provider=ollama or install transformers+torch')
     try:
-        tok = AutoTokenizer.from_pretrained(HF_GEMMA_MODEL, token=HF_TOKEN)
-        model = AutoModelForCausalLM.from_pretrained(HF_GEMMA_MODEL, device_map='auto' if HF_USE_GPU else None, torch_dtype='auto')
+        tok = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN)
+        model = AutoModelForCausalLM.from_pretrained(model_id, device_map='auto' if HF_USE_GPU else None, torch_dtype='auto')
         sys_prompt = f'Summarize the following transcript in style={style}. Keep it concise and faithful.'
         prompt = f'<start_of_turn>user\n{sys_prompt}\n\nTranscript:\n{text[:8000]}<end_of_turn>\n<start_of_turn>model\n'
         inputs = tok(prompt, return_tensors='pt').to(model.device)
@@ -2831,7 +2859,7 @@ def _summarize_hf(text: str, style: str) -> str:
         s = tok.decode(out[0], skip_special_tokens=True)
         return s.split('<start_of_turn>model', 1)[-1].strip()
     except Exception as e:
-        raise HTTPException(500, f'HF Gemma generation failed: {e}')
+        raise HTTPException(500, f'HF summary generation failed: {e}')
 
 
 def _get_transcript(video_id: str) -> dict[str, Any]:
@@ -2890,7 +2918,6 @@ def yt_summarize(body: dict[str, Any] = Body(...)):
         HTTPException: 400 if video_id not provided, 404 if transcript not found.
     """
     vid = body.get('video_id')
-    provider = (body.get('provider') or YT_SUMMARY_PROVIDER).lower()
     style = (body.get('style') or 'short')
     if not vid:
         raise HTTPException(400, 'video_id required')
@@ -2898,16 +2925,33 @@ def yt_summarize(body: dict[str, Any] = Body(...)):
     text = body.get('text') or tr.get('text')
     if not text:
         raise HTTPException(404, 'transcript not found; run /yt/transcript first')
+    runtime = _resolve_summary_runtime(body.get('provider'))
+    provider = runtime['provider']
     if provider == 'hf':
-        summary = _summarize_hf(text, style)
+        summary = _summarize_hf(text, style, runtime['model_id'])
     else:
-        summary = _summarize_ollama(text, style)
+        summary = _summarize_ollama(text, style, runtime['model_id'])
+    model_meta = {
+        'role': runtime['role'],
+        'model_alias': runtime['model_alias'],
+        'model_id': runtime['model_id'],
+    }
     # persist into videos + studio_board meta
-    _merge_video_meta(vid, {'style': style, 'provider': provider, 'summary': summary})
+    _merge_video_meta(vid, {'style': style, 'provider': provider, 'summary': summary, 'model': model_meta})
     # emit event for downstream (Discord/NATS)
     with suppress(Exception):
-        _publish_event('ingest.summary.ready.v1', {'video_id': vid, 'style': style, 'provider': provider, 'summary': summary[:500]})
-    return {'ok': True, 'video_id': vid, 'provider': provider, 'style': style, 'summary': summary}
+        _publish_event(
+            'ingest.summary.ready.v1',
+            {
+                'video_id': vid,
+                'style': style,
+                'provider': provider,
+                'model_alias': runtime['model_alias'],
+                'model_id': runtime['model_id'],
+                'summary': summary[:500],
+            },
+        )
+    return {'ok': True, 'video_id': vid, 'provider': provider, 'style': style, 'model': model_meta, 'summary': summary}
 
 
 @app.post('/yt/chapters')
@@ -2930,7 +2974,6 @@ def yt_chapters(body: dict[str, Any] = Body(...)):
         HTTPException: 400 if video_id not provided, 404 if transcript not found.
     """
     vid = body.get('video_id')
-    provider = (body.get('provider') or YT_SUMMARY_PROVIDER).lower()
     if not vid:
         raise HTTPException(400, 'video_id required')
     tr = _get_transcript(vid)
@@ -2938,10 +2981,12 @@ def yt_chapters(body: dict[str, Any] = Body(...)):
     if not text:
         raise HTTPException(404, 'transcript not found; run /yt/transcript first')
     guide = 'Produce 5-12 chapters. JSON array of objects: {title, blurb}. No extra prose.'
+    runtime = _resolve_summary_runtime(body.get('provider'))
+    provider = runtime['provider']
     if provider == 'hf':
-        raw = _summarize_hf(text, f'chapters; {guide}')
+        raw = _summarize_hf(text, f'chapters; {guide}', runtime['model_id'])
     else:
-        raw = _summarize_ollama(text, f'chapters; {guide}')
+        raw = _summarize_ollama(text, f'chapters; {guide}', runtime['model_id'])
     # try parse JSON array
     chapters: list[dict[str, Any]] = []
     try:
@@ -2951,10 +2996,41 @@ def yt_chapters(body: dict[str, Any] = Body(...)):
     except Exception:
         # fallback: split lines
         chapters = [{'title': line.strip('- ').strip(), 'blurb': ''} for line in raw.splitlines() if line.strip()][:10]
-    _merge_video_meta(vid, {'chapters': chapters})
+    _merge_video_meta(
+        vid,
+        {
+            'chapters': chapters,
+            'chapters_model': {
+                'provider': provider,
+                'role': runtime['role'],
+                'model_alias': runtime['model_alias'],
+                'model_id': runtime['model_id'],
+            },
+        },
+    )
     with suppress(Exception):
-        _publish_event('ingest.chapters.ready.v1', {'video_id': vid, 'n': len(chapters), 'chapters': chapters[:6]})
-    return {'ok': True, 'video_id': vid, 'chapters': chapters}
+        _publish_event(
+            'ingest.chapters.ready.v1',
+            {
+                'video_id': vid,
+                'provider': provider,
+                'model_alias': runtime['model_alias'],
+                'model_id': runtime['model_id'],
+                'n': len(chapters),
+                'chapters': chapters[:6],
+            },
+        )
+    return {
+        'ok': True,
+        'video_id': vid,
+        'provider': provider,
+        'model': {
+            'role': runtime['role'],
+            'model_alias': runtime['model_alias'],
+            'model_id': runtime['model_id'],
+        },
+        'chapters': chapters,
+    }
 
 
 @app.post('/yt/docs/sync')
