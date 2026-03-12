@@ -25,6 +25,9 @@ jobs:
     - name: Install test requirements
       shell: bash
       run: python ./devscripts/install_deps.py --omit-default --include-extra test
+    - name: Install PMOVES.YT service requirements
+      shell: bash
+      run: python -m pip install -r pmoves_yt_service/requirements-ci.txt
     - name: Run tests
       timeout-minutes: 15
       shell: bash

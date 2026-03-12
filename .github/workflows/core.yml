@@ -67,6 +67,8 @@ jobs:
         python-version: ${{ matrix.python-version }}
     - name: Install test requirements
       run: python ./devscripts/install_deps.py --include-extra test --include-extra curl-cffi
+    - name: Install PMOVES.YT service requirements
+      run: python -m pip install -r pmoves_yt_service/requirements-ci.txt
     - name: Run tests
       timeout-minutes: 15
       continue-on-error: False
