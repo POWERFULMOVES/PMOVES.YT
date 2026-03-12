@@ -47,6 +47,20 @@ YouTube ingest helper that emits CHIT geometry after analysis.
   Google credentials and explicit approval/audit hooks, rather than trying to extend yt-dlp for
   write operations it is not designed to own.
 
+### Initial owned-channel control endpoints
+
+- `GET /yt/control/status`
+  - reports whether Google client credentials, a default refresh token, and approval gating are configured
+- `POST /yt/control/playlist/add`
+  - preview or execute adding a video to a playlist
+- `POST /yt/control/comment`
+  - preview or execute a top-level comment or reply
+- These endpoints:
+  - are protected by the same `X-API-Key` gate used by docs sync when API keys are configured
+  - default to preview mode (`execute=false`)
+  - require `approved_by` when `YT_CONTROL_REQUIRE_APPROVAL=true` and `execute=true`
+  - use the YouTube Data API, not yt-dlp
+
 ## Resilient Playlist Ingest (2025-10)
 
 - `/yt/playlist` now runs downloads concurrently (bounded by `YT_CONCURRENCY`) with

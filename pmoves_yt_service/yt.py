@@ -72,6 +72,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 from fastapi import FastAPI, Body, HTTPException, BackgroundTasks, Depends, Header, Response
+from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager, suppress
 try:
     import yt_dlp
@@ -352,9 +353,7 @@ def _configured_api_keys() -> set[str]:
 
 async def require_docs_sync_access(x_api_key: str | None = Header(default=None, alias='X-API-Key')) -> None:
     """Protect docs sync with optional API-key auth and a simple cooldown window."""
-    keys = _configured_api_keys()
-    if keys and x_api_key not in keys:
-        raise HTTPException(status_code=401, detail='Invalid or missing API key')
+    await require_control_plane_access(x_api_key)
 
     cooldown_raw = os.environ.get('YT_DOCS_SYNC_MIN_INTERVAL_SECONDS', '30')
     try:
@@ -373,6 +372,14 @@ async def require_docs_sync_access(x_api_key: str | None = Header(default=None, 
         _docs_sync_last_request_ts = now
     return None
 
+
+async def require_control_plane_access(x_api_key: str | None = Header(default=None, alias='X-API-Key')) -> None:
+    """Protect control-plane actions with the shared API-key gate when configured."""
+    keys = _configured_api_keys()
+    if keys and x_api_key not in keys:
+        raise HTTPException(status_code=401, detail='Invalid or missing API key')
+    return None
+
 # Prefer package-local helpers first now that PMOVES.YT is the authoritative
 # runtime lane. Fall back to the root-repo compatibility mirror if needed.
 try:
@@ -385,6 +392,20 @@ except ImportError:  # pragma: no cover
         logger.debug('docs_sync: not available — docs sync disabled')
         collect_yt_dlp_docs = None  # type: ignore
         sync_to_supabase = None  # type: ignore
+try:
+    from .youtube_control import (
+        YouTubeControlError,
+        insert_comment,
+        insert_playlist_item,
+        refresh_access_token,
+    )
+except ImportError:  # pragma: no cover
+    from youtube_control import (  # type: ignore
+        YouTubeControlError,
+        insert_comment,
+        insert_playlist_item,
+        refresh_access_token,
+    )
 try:
     from .docs_catalog import options_catalog, extractor_count, version_info  # type: ignore
 except Exception:  # pragma: no cover
@@ -466,6 +487,10 @@ CHANNEL_MONITOR_STATUS_SECRET = os.environ.get('CHANNEL_MONITOR_STATUS_SECRET')
 # Summarization (Gemma) configuration
 YT_SUMMARY_PROVIDER = os.environ.get('YT_SUMMARY_PROVIDER', 'ollama')  # ollama|hf
 OLLAMA_URL = os.environ.get('OLLAMA_URL', 'http://localhost:11434')
+YT_GOOGLE_CLIENT_ID = (os.environ.get('YT_GOOGLE_CLIENT_ID') or '').strip()
+YT_GOOGLE_CLIENT_SECRET = (os.environ.get('YT_GOOGLE_CLIENT_SECRET') or '').strip()
+YT_GOOGLE_REFRESH_TOKEN = (os.environ.get('YT_GOOGLE_REFRESH_TOKEN') or '').strip()
+YT_CONTROL_REQUIRE_APPROVAL = os.environ.get('YT_CONTROL_REQUIRE_APPROVAL', 'true').lower() == 'true'
 YT_SUMMARY_ROLE = os.environ.get('YT_SUMMARY_ROLE', 'creator_summary')
 YT_SUMMARY_OLLAMA_ALIAS = os.environ.get('YT_SUMMARY_OLLAMA_ALIAS', YT_SUMMARY_ROLE)
 YT_SUMMARY_HF_ALIAS = os.environ.get('YT_SUMMARY_HF_ALIAS', YT_SUMMARY_ROLE)
@@ -936,6 +961,93 @@ def _publish_event(topic: str, payload: dict[str, Any]):
         nats_messages_total.labels(subject=topic.replace('.', '_')).inc()
     except Exception as exc:
         logger.exception('Failed to schedule publish for topic %s: %s', topic, exc)
+
+
+class YouTubeControlRequest(BaseModel):
+    execute: bool = Field(False, description='Execute the action instead of returning a preview')
+    refresh_token: str | None = Field(None, description='Optional refresh token override')
+    approved_by: str | None = Field(None, description='Actor approving the control-plane action')
+    approval_note: str | None = Field(None, description='Optional approval note or ticket')
+    request_source: str = Field('pmoves-yt', description='Logical source initiating the request')
+
+
+class PlaylistItemAddRequest(YouTubeControlRequest):
+    playlist_id: str = Field(..., description='Target YouTube playlist ID')
+    video_id: str = Field(..., description='YouTube video ID to add')
+    position: int | None = Field(None, description='Optional target position inside the playlist')
+
+
+class CommentCreateRequest(YouTubeControlRequest):
+    video_id: str = Field(..., description='Target YouTube video ID')
+    text: str = Field(..., min_length=1, description='Comment or reply text')
+    parent_comment_id: str | None = Field(None, description='Parent comment ID when creating a reply')
+
+
+def _control_plane_status() -> dict[str, Any]:
+    return {
+        'google_client_configured': bool(YT_GOOGLE_CLIENT_ID and YT_GOOGLE_CLIENT_SECRET),
+        'default_refresh_token_configured': bool(YT_GOOGLE_REFRESH_TOKEN),
+        'approval_required': YT_CONTROL_REQUIRE_APPROVAL,
+    }
+
+
+def _ensure_control_execute_allowed(execute: bool, approved_by: str | None) -> None:
+    if not execute:
+        return
+    if YT_CONTROL_REQUIRE_APPROVAL and not approved_by:
+        raise HTTPException(status_code=400, detail='approved_by is required when execute=true')
+    if not YT_GOOGLE_CLIENT_ID or not YT_GOOGLE_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail='YouTube control plane is not configured')
+
+
+def _resolve_control_refresh_token(refresh_token: str | None) -> str:
+    token = (refresh_token or YT_GOOGLE_REFRESH_TOKEN).strip()
+    if not token:
+        raise HTTPException(status_code=400, detail='No refresh token configured for YouTube control action')
+    return token
+
+
+def _control_preview(action: str, body: YouTubeControlRequest, details: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        'action': action,
+        'execute': body.execute,
+        'approved_by': body.approved_by,
+        'approval_note': body.approval_note,
+        'request_source': body.request_source,
+        'details': details,
+        'control_plane': _control_plane_status(),
+    }
+    if not body.execute:
+        _publish_event('creator.youtube.control.preview.v1', payload)
+    return payload
+
+
+def _execute_playlist_add(body: PlaylistItemAddRequest) -> dict[str, Any]:
+    access_token = refresh_access_token(
+        client_id=YT_GOOGLE_CLIENT_ID,
+        client_secret=YT_GOOGLE_CLIENT_SECRET,
+        refresh_token=_resolve_control_refresh_token(body.refresh_token),
+    )
+    return insert_playlist_item(
+        access_token=access_token,
+        playlist_id=body.playlist_id,
+        video_id=body.video_id,
+        position=body.position,
+    )
+
+
+def _execute_comment_create(body: CommentCreateRequest) -> dict[str, Any]:
+    access_token = refresh_access_token(
+        client_id=YT_GOOGLE_CLIENT_ID,
+        client_secret=YT_GOOGLE_CLIENT_SECRET,
+        refresh_token=_resolve_control_refresh_token(body.refresh_token),
+    )
+    return insert_comment(
+        access_token=access_token,
+        video_id=body.video_id,
+        text=body.text,
+        parent_comment_id=body.parent_comment_id,
+    )
 
 
 def upload_to_s3(local_path: str, bucket: str, key: str):
@@ -3077,6 +3189,72 @@ def yt_docs_catalog():
         return {'ok': True, 'meta': meta, **cat}
     except Exception as exc:  # pragma: no cover
         raise HTTPException(500, f'catalog error: {exc}')
+
+
+@app.get('/yt/control/status')
+async def yt_control_status(_: None = Depends(require_control_plane_access)) -> dict[str, Any]:
+    """Return YouTube owned-channel control plane readiness."""
+    return _control_plane_status()
+
+
+@app.post('/yt/control/playlist/add')
+async def yt_control_playlist_add(
+    body: PlaylistItemAddRequest,
+    _: None = Depends(require_control_plane_access),
+) -> dict[str, Any]:
+    """Preview or execute adding a video to an owned playlist via YouTube Data API."""
+    _ensure_control_execute_allowed(body.execute, body.approved_by)
+    preview = _control_preview(
+        'playlist_add',
+        body,
+        {
+            'playlist_id': body.playlist_id,
+            'video_id': body.video_id,
+            'position': body.position,
+        },
+    )
+    if not body.execute:
+        return {'status': 'preview', **preview}
+    try:
+        result = await asyncio.to_thread(_execute_playlist_add, body)
+    except YouTubeControlError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    payload = {
+        **preview,
+        'result': result,
+    }
+    _publish_event('creator.youtube.control.executed.v1', payload)
+    return {'status': 'executed', **payload}
+
+
+@app.post('/yt/control/comment')
+async def yt_control_comment(
+    body: CommentCreateRequest,
+    _: None = Depends(require_control_plane_access),
+) -> dict[str, Any]:
+    """Preview or execute a YouTube comment/reply via YouTube Data API."""
+    _ensure_control_execute_allowed(body.execute, body.approved_by)
+    preview = _control_preview(
+        'comment_create',
+        body,
+        {
+            'video_id': body.video_id,
+            'parent_comment_id': body.parent_comment_id,
+            'text_preview': body.text[:120],
+        },
+    )
+    if not body.execute:
+        return {'status': 'preview', **preview}
+    try:
+        result = await asyncio.to_thread(_execute_comment_create, body)
+    except YouTubeControlError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    payload = {
+        **preview,
+        'result': result,
+    }
+    _publish_event('creator.youtube.control.executed.v1', payload)
+    return {'status': 'executed', **payload}
 
 # -------------------- Segmentation → JSONL + CGP emit --------------------
 
