@@ -3,25 +3,30 @@
 YouTube ingest helper that emits CHIT geometry after analysis.
 
 ## Service & Ports
+
 - Compose service: `pmoves-yt`
 - Starts with `make up-yt` (brings up `ffmpeg-whisper` too)
 
 ## Geometry Bus (CHIT) Integration
+
 - Publishes `geometry.cgp.v1` to the Hi‑RAG gateway:
   - Endpoint: `POST ${HIRAG_URL}/geometry/event`
 - Environment:
   - `HIRAG_URL` — base URL for the geometry gateway (`http://localhost:8086` by default)
 
 ## Smoke
+
 - See `pmoves/services/pmoves-yt/tests/test_emit.py` for the CGP emission assertion.
 - Run the main smokes in `pmoves/docs/SMOKETESTS.md` after `make up`.
 
 ## Testing
+
 - Unit suite: `python -m pytest pmoves/services/pmoves-yt/tests`
 - Async playlist pacing coverage (`tests/test_rate_limit.py::test_playlist_rate_limit_sleep`) now relies on `pytest-asyncio` for event loop orchestration. The dependency ships in `services/pmoves-yt/requirements.txt`, so re-run `python -m pip install -r services/pmoves-yt/requirements.txt` after pulling this change to keep the test harness green.
 - Offline bundle refresh: `make vendor-httpx` (requires [uv](https://github.com/astral-sh/uv)) rebuilds `pmoves/vendor/python/` so helper scripts like `pmoves/scripts/backfill_jellyfin_metadata.py` can import `httpx` without pip.
 
 ## Resilient Playlist Ingest (2025-10)
+
 - `/yt/playlist` now runs downloads concurrently (bounded by `YT_CONCURRENCY`) with
   an async worker pool and coordinated rate limiting (`YT_RATE_LIMIT`).
 - Transient errors (network, 5xx, yt-dlp hiccups) retry with exponential backoff
@@ -36,6 +41,7 @@ YouTube ingest helper that emits CHIT geometry after analysis.
   events so downstream automations (Discord, n8n) can react in real time.
 
 ## Channel Monitor Enrichment (2025-10-26)
+
 - `pmoves.channel_monitor` now forwards detailed channel metadata with each
   queue payload. pmoves-yt persists the enriched context into the
   `youtube_transcripts` table via new columns:
@@ -48,17 +54,18 @@ YouTube ingest helper that emits CHIT geometry after analysis.
   without additional joins — e.g. `channel_tags @> '{"darkxside"}'`.
 
 ### yt-dlp configuration & images (2025-12)
+
 - `yt-dlp[default]` + `curl-cffi` ship from PyPI at build time; `ffmpeg` and `atomicparsley`
   are installed via apt so metadata/thumbnail embedding works out of the box.
 - Build args:
   - `YTDLP_VERSION=YYYY.MM.DD` to pin an exact release.
   - `YTDLP_PIP_URL=<pip URL>` to consume a fork (e.g., git+https). `YTDLP_PIP_URL` wins over `YTDLP_VERSION`.
-- Weekly bump workflow `.github/workflows/yt-dlp-bump.yml` opens a PR with the latest yt-dlp and validates a multi-arch build.
+- Weekly bump workflow `.github/workflows/yt-dlp-bump.yml` opens a PR with the latest yt-dlp and validates a multi-arch GitHub build.
   Override or skip by supplying your own `YTDLP_VERSION`/`YTDLP_PIP_URL` in image builds.
 
 Example:
 
-```
+```bash
 # Pin by version
 docker build --build-arg YTDLP_VERSION=2025.10.15 -t ghcr.io/powerfulmoves/pmoves-yt:dev services/pmoves-yt
 
@@ -74,7 +81,7 @@ We maintain a fork to stabilize SABR/nsig workarounds and keep yt‑dlp fresh:
 - Repo: https://github.com/POWERFULMOVES/PMOVES.YT.git
 - Helpers from repo root:
 
-```
+```bash
 make -C pmoves yt-integrations-clone
 make -C pmoves yt-integrations-build YTDLP_VERSION=2025.10.15
 make -C pmoves yt-integrations-push
@@ -100,11 +107,15 @@ and tag a local image quickly with a custom `YTDLP_VERSION`.
 
 ### Keep yt-dlp options discoverable (docs → Supabase)
 
+Docs sync is protected by `X-API-Key` when `VALID_API_KEYS` is configured and
+throttled by `YT_DOCS_SYNC_MIN_INTERVAL_SECONDS` (default `30` seconds).
+
 To surface the full, current yt‑dlp CLI options to the UI and automations,
 pmoves-yt can ingest its own help into Supabase:
 
-```
-curl -X POST http://localhost:8091/yt/docs/sync
+```bash
+curl -X POST http://localhost:8077/yt/docs/sync \
+  -H 'X-API-Key: YOUR_API_KEY'
 ```
 
 This captures `yt-dlp --help`, `--list-extractors`, and `--dump-user-agent` and
@@ -113,12 +124,14 @@ Ensure the Supabase REST URL/key env vars are set (compose does this by default)
 
 ### Options Catalog endpoint (new)
 
+
 - `GET /yt/docs/catalog` returns:
   - `meta.yt_dlp_version`, `meta.extractor_count`
   - a structured `options[]` catalog (flags, dest, help, default, choices)
   - counts for quick UI rendering
 
 ### Automatic docs sync
+
 
 - Env: `YT_DOCS_SYNC_ON_START=true` to sync on container start (default true)
 - Env: `YT_DOCS_SYNC_INTERVAL_SECONDS=86400` to enable periodic sync
@@ -128,12 +141,12 @@ Ensure the Supabase REST URL/key env vars are set (compose does this by default)
 If you have a classic `yt-dlp` `config.txt`, convert it into a `yt_options` JSON
 that this service understands:
 
-```
+```bash
 python pmoves/services/pmoves-yt/tools/ytdlp_config_to_options.py \
   pmoves/docs/PMOVES.AI\ PLANS/PMOVES.yt/yt-dlp-config/config.txt \
   > /tmp/yt_options.json
 
-curl -sS -X POST http://localhost:8091/yt/download \
+curl -sS -X POST http://localhost:8077/yt/download \
   -H 'content-type: application/json' \
   -d @/tmp/yt_options.json | jq .
 ```
@@ -147,6 +160,7 @@ unknown flags out for safety. See the detailed mapping and caveats in:
 
 
 ## Hi‑RAG upsert pacing (2025-10-24)
+
 - `/yt/emit` switches to a background task when `YT_ASYNC_UPSERT_ENABLED=true` and the
   segmented chunk count ≥ `YT_ASYNC_UPSERT_MIN_CHUNKS` (defaults: enabled, 200 chunks).
   The API response returns `{"async": true, "job_id": "..."}`; poll

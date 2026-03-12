@@ -22,7 +22,12 @@ pmoves-yt:
   build:
     context: ../PMOVES.YT
     dockerfile: pmoves_yt_service/Dockerfile
+    args:
+      YTDLP_VERSION: ${YTDLP_VERSION:-}
+      YTDLP_PIP_URL: ${YTDLP_PIP_URL:-}
 ```
+
+See `pmoves_yt_service/README.md` for the full build-arg contract and operator examples.
 
 ## Runtime contract
 

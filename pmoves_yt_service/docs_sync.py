@@ -1,16 +1,20 @@
 import os
 import subprocess
 import json
+import logging
 from datetime import datetime, timezone
-from typing import Dict, Any
 
+import requests
+import yt_dlp
 from yt_dlp.version import __version__ as YT_DLP_VERSION
 
+logger = logging.getLogger(__name__)
+
 SUPA = (
-    os.environ.get("SUPABASE_REST_URL")
-    or os.environ.get("SUPA_REST_URL")
-    or "http://postgrest:3000"
-).rstrip("/")
+    os.environ.get('SUPABASE_REST_URL')
+    or os.environ.get('SUPA_REST_URL')
+    or 'http://postgrest:3000'
+).rstrip('/')
 
 
 def _candidate_keys() -> list[str]:
@@ -18,9 +22,9 @@ def _candidate_keys() -> list[str]:
     # SUPABASE_ANON_KEY is intentionally excluded — anon tokens lack INSERT
     # privileges on pmoves_core tables and would silently produce 403s.
     keys = [
-        os.environ.get("SUPABASE_SERVICE_ROLE_KEY"),
-        os.environ.get("SUPABASE_SERVICE_KEY"),
-        os.environ.get("SUPABASE_KEY"),
+        os.environ.get('SUPABASE_SERVICE_ROLE_KEY'),
+        os.environ.get('SUPABASE_SERVICE_KEY'),
+        os.environ.get('SUPABASE_KEY'),
     ]
     out: list[str] = []
     for key in keys:
@@ -30,56 +34,74 @@ def _candidate_keys() -> list[str]:
             out.append(key)
     return out
 
-def _capture_cmd(args: list[str]) -> str:
+
+def _capture_cmd(args: list[str]) -> str | None:
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=20)
         if proc.returncode != 0:
-            return proc.stderr.strip() or proc.stdout.strip()
+            logger.warning(
+                'yt-dlp docs command failed: args=%s rc=%s stderr=%s stdout=%s',
+                args,
+                proc.returncode,
+                proc.stderr.strip(),
+                proc.stdout.strip(),
+            )
+            return None
         return proc.stdout
     except Exception as exc:  # best-effort
-        return f"<error: {exc}>"
+        logger.warning('yt-dlp docs command raised: args=%s err=%s', args, exc)
+        return None
 
-def collect_yt_dlp_docs() -> Dict[str, Any]:
-    import yt_dlp  # type: ignore
-    version = getattr(yt_dlp, "version", None)
+
+def collect_yt_dlp_docs() -> dict[str, object]:
+    version = getattr(yt_dlp, 'version', None)
     if isinstance(version, str):
         ver = version
     else:
-        ver = getattr(yt_dlp, "__version__", None) or YT_DLP_VERSION or "unknown"
-    docs: Dict[str, Any] = {
-        "version": ver,
-        "help_cli": _capture_cmd(["yt-dlp", "--help"]),
-        "extractors": _capture_cmd(["yt-dlp", "--list-extractors"]),
-        "user_agent": _capture_cmd(["yt-dlp", "--dump-user-agent"]),
-        "ts": datetime.now(timezone.utc).isoformat(),
+        ver = getattr(yt_dlp, '__version__', None) or YT_DLP_VERSION or 'unknown'
+    docs: dict[str, object] = {
+        'version': ver,
+        'ts': datetime.now(timezone.utc).isoformat(),
     }
+    for key, args in (
+        ('help_cli', ['yt-dlp', '--help']),
+        ('extractors', ['yt-dlp', '--list-extractors']),
+        ('user_agent', ['yt-dlp', '--dump-user-agent']),
+    ):
+        output = _capture_cmd(args)
+        if output is not None:
+            docs[key] = output
     return docs
 
-def sync_to_supabase(docs: Dict[str, Any]) -> Dict[str, Any]:
+
+def sync_to_supabase(docs: dict[str, object]) -> dict[str, object]:
     keys = _candidate_keys()
     if not keys:
-        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY (or equivalent) is required")
-    tool = "yt-dlp"
-    ver = docs.get("version") or "unknown"
+        raise RuntimeError('SUPABASE_SERVICE_ROLE_KEY (or equivalent) is required')
+    tool = 'yt-dlp'
+    ver = docs.get('version') or 'unknown'
     rows = []
-    for k in ("help_cli", "extractors", "user_agent"):
+    for k in ('help_cli', 'extractors', 'user_agent'):
         content = docs.get(k)
+        if content is None:
+            continue
         # Store as JSON with `text` field for consistency
         rows.append({
-            "tool": tool,
-            "version": str(ver),
-            "doc_type": k,
-            "content": {"text": content},
+            'tool': tool,
+            'version': str(ver),
+            'doc_type': k,
+            'content': {'text': content},
         })
-    import requests
-    on_conflict = "tool%2Cversion%2Cdoc_type"
+    if not rows:
+        raise RuntimeError('yt-dlp docs collection returned no usable content')
+    on_conflict = 'tool%2Cversion%2Cdoc_type'
     targets = [
         # Preferred: proper PostgREST profile headers for pmoves_core schema.
-        {"url": f"{SUPA}/tool_docs?on_conflict={on_conflict}", "schema": "pmoves_core"},
+        {'url': f'{SUPA}/tool_docs?on_conflict={on_conflict}', 'schema': 'pmoves_core'},
         # Legacy fallback: existing callers that encode schema in table path.
-        {"url": f"{SUPA}/pmoves_core.tool_docs?on_conflict={on_conflict}", "schema": None},
+        {'url': f'{SUPA}/pmoves_core.tool_docs?on_conflict={on_conflict}', 'schema': None},
         # Last fallback if schema support is not configured.
-        {"url": f"{SUPA}/tool_docs?on_conflict={on_conflict}", "schema": None},
+        {'url': f'{SUPA}/tool_docs?on_conflict={on_conflict}', 'schema': None},
     ]
 
     last_error: str | None = None
@@ -88,27 +110,27 @@ def sync_to_supabase(docs: Dict[str, Any]) -> Dict[str, Any]:
         transport_error = False
         for key in keys:
             headers = {
-                "apikey": key,
-                "Authorization": f"Bearer {key}",
-                "content-type": "application/json",
-                "Prefer": "resolution=merge-duplicates",
+                'apikey': key,
+                'Authorization': f'Bearer {key}',
+                'content-type': 'application/json',
+                'Prefer': 'resolution=merge-duplicates,return=minimal',
             }
-            if target["schema"]:
-                headers["Accept-Profile"] = target["schema"]
-                headers["Content-Profile"] = target["schema"]
+            if target['schema']:
+                headers['Accept-Profile'] = target['schema']
+                headers['Content-Profile'] = target['schema']
             try:
-                r = requests.post(target["url"], headers=headers, data=json.dumps(rows), timeout=20)
+                r = requests.post(target['url'], headers=headers, json=rows, timeout=20)
             except requests.RequestException as exc:
-                last_error = f"transport error: {exc}"
+                last_error = f'transport error: {exc}'
                 transport_error = True
                 break
             try:
                 body = r.json()
             except ValueError:
-                body = {"text": r.text}
+                body = {'text': r.text}
             if r.ok:
-                return {"status": "ok", "count": len(rows), "version": ver}
-            last_error = f"{r.status_code} {body}"
+                return {'status': 'ok', 'count': len(rows), 'version': ver}
+            last_error = f'{r.status_code} {body}'
             # JWT/key mismatch can happen when layered env files contain stale aliases.
             # Continue trying available keys before failing hard.
             if r.status_code in (401, 403):
@@ -120,9 +142,10 @@ def sync_to_supabase(docs: Dict[str, Any]) -> Dict[str, Any]:
         if missing_relation or transport_error:
             continue
 
-    raise RuntimeError(f"Supabase upsert failed: {last_error}")
+    raise RuntimeError(f'Supabase upsert failed: {last_error}')
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     data = collect_yt_dlp_docs()
     out = sync_to_supabase(data)
     print(json.dumps(out))

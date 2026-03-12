@@ -14,16 +14,19 @@ Runtime model:
 - `/yt/docs/catalog` and `/yt/docs/sync` are owned here.
 
 Local build:
+
 ```bash
 docker build -f pmoves_yt_service/Dockerfile -t pmoves-yt:dev .
 ```
 
 Local run:
+
 ```bash
 docker run --rm -p 8077:8077 pmoves-yt:dev
 ```
 
 Primary validation:
+
 ```bash
 curl http://localhost:8077/healthz
 curl http://localhost:8077/yt/docs/catalog

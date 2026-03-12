@@ -61,7 +61,7 @@ import os, json, tempfile, shutil, asyncio, time, re, math, uuid, copy, logging,
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
-from fastapi import FastAPI, Body, HTTPException, BackgroundTasks, Response
+from fastapi import FastAPI, Body, HTTPException, BackgroundTasks, Depends, Header, Response
 from contextlib import asynccontextmanager
 try:
     import yt_dlp
@@ -306,6 +306,47 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
     logger.addHandler(handler)
 logger.propagate = True
+
+_docs_sync_rate_limit_lock = threading.Lock()
+_docs_sync_last_request_ts = 0.0
+
+
+def _configured_api_keys() -> set[str]:
+    raw = (
+        os.environ.get('VALID_API_KEYS')
+        or os.environ.get('NEXT_PUBLIC_BACKEND_API_KEY')
+        or os.environ.get('BACKEND_API_KEY')
+        or ''
+    )
+    return {
+        token.strip()
+        for token in re.split(r'[\s,;]+', raw)
+        if token.strip()
+    }
+
+
+async def require_docs_sync_access(x_api_key: str | None = Header(default=None, alias='X-API-Key')) -> None:
+    """Protect docs sync with optional API-key auth and a simple cooldown window."""
+    keys = _configured_api_keys()
+    if keys and x_api_key not in keys:
+        raise HTTPException(status_code=401, detail='Invalid or missing API key')
+
+    cooldown_raw = os.environ.get('YT_DOCS_SYNC_MIN_INTERVAL_SECONDS', '30')
+    try:
+        cooldown = float(cooldown_raw)
+    except ValueError:
+        cooldown = 30.0
+    if cooldown <= 0:
+        return None
+
+    global _docs_sync_last_request_ts
+    now = time.monotonic()
+    with _docs_sync_rate_limit_lock:
+        wait_for = cooldown - (now - _docs_sync_last_request_ts)
+        if wait_for > 0:
+            raise HTTPException(status_code=429, detail=f'docs sync rate limited; retry in {wait_for:.1f}s')
+        _docs_sync_last_request_ts = now
+    return None
 
 # Prefer package-local helpers first now that PMOVES.YT is the authoritative
 # runtime lane. Fall back to the root-repo compatibility mirror if needed.
@@ -2787,7 +2828,7 @@ def yt_chapters(body: Dict[str,Any] = Body(...)):
     return {'ok': True, 'video_id': vid, 'chapters': chapters}
 
 @app.post('/yt/docs/sync')
-def yt_docs_sync():
+def yt_docs_sync(_: None = Depends(require_docs_sync_access)):
     """Upsert yt-dlp CLI docs into Supabase (pmoves_core.tool_docs).
 
     Triggers documentation collection from yt-dlp and syncs to Supabase

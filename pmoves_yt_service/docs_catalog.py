@@ -20,17 +20,17 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, tuple):
         return list(value)
     if isinstance(value, list):
-        return value
+        return list(value)
     if isinstance(value, dict):
-        return value
+        return dict(value)
     return str(value)
 
 
 @lru_cache(maxsize=1)
 def version_info() -> dict[str, Any]:
-    version_mod = getattr(yt_dlp, "version", None)
-    version = getattr(version_mod, "__version__", None) or getattr(yt_dlp, "__version__", None) or "unknown"
-    return {"yt_dlp_version": version}
+    version_mod = getattr(yt_dlp, 'version', None)
+    version = getattr(version_mod, '__version__', None) or getattr(yt_dlp, '__version__', None) or 'unknown'
+    return {'yt_dlp_version': version}
 
 
 @lru_cache(maxsize=1)
@@ -46,31 +46,30 @@ def options_catalog() -> dict[str, Any]:
 
     for group in parser.option_groups:
         group_count += 1
-        group_name = getattr(group, "title", None) or "Options"
-        for option in getattr(group, "option_list", []):
-            flags = [*getattr(option, "_short_opts", []), *getattr(option, "_long_opts", [])]
+        group_name = getattr(group, 'title', None) or 'Options'
+        for option in getattr(group, 'option_list', []):
+            flags = [*getattr(option, '_short_opts', []), *getattr(option, '_long_opts', [])]
             if not flags:
                 continue
             if option.help in (None, optparse.SUPPRESS_HELP):
                 continue
             options.append(
                 {
-                    "group": group_name,
-                    "flags": flags,
-                    "dest": option.dest,
-                    "help": str(option.help).strip(),
-                    "default": _json_safe(option.default),
-                    "choices": _json_safe(getattr(option, "choices", None)),
-                    "metavar": getattr(option, "metavar", None),
-                    "action": getattr(option, "action", None),
-                }
+                    'group': group_name,
+                    'flags': flags,
+                    'dest': option.dest,
+                    'help': str(option.help).strip(),
+                    'default': _json_safe(option.default),
+                    'choices': _json_safe(getattr(option, 'choices', None)),
+                    'metavar': getattr(option, 'metavar', None),
+                    'action': getattr(option, 'action', None),
+                },
             )
 
     return {
-        "options": options,
-        "counts": {
-            "options": len(options),
-            "groups": group_count,
+        'options': options,
+        'counts': {
+            'options': len(options),
+            'groups': group_count,
         },
     }
-
