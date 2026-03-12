@@ -283,3 +283,42 @@ def test_comment_execute_uses_youtube_control_runtime(monkeypatch):
     assert events[0][0] == 'creator.youtube.control.executed.v1'
     assert audits[0]['status'] == 'executed'
     assert audits[0]['action'] == 'comment_create'
+
+
+def test_reply_execute_uses_youtube_control_runtime(monkeypatch):
+    events = []
+    audits = []
+    monkeypatch.setattr(app_module, '_publish_event', lambda topic, payload: events.append((topic, payload)))
+    monkeypatch.setattr(app_module, '_record_control_action', lambda **kwargs: audits.append(kwargs))
+    monkeypatch.setattr(app_module, 'YT_GOOGLE_CLIENT_ID', 'client-id')
+    monkeypatch.setattr(app_module, 'YT_GOOGLE_CLIENT_SECRET', 'client-secret')
+    monkeypatch.setattr(app_module, 'YT_GOOGLE_REFRESH_TOKEN', 'refresh-token')
+    monkeypatch.setattr(app_module, 'YT_CONTROL_REQUIRE_APPROVAL', True)
+    monkeypatch.setattr(app_module, 'refresh_access_token', lambda **kwargs: 'access-token')
+    monkeypatch.setattr(
+        app_module,
+        'insert_comment',
+        lambda **kwargs: {'id': 'reply-1', 'snippet': {'parentId': kwargs['parent_comment_id']}},
+    )
+
+    client = TestClient(app_module.app)
+    resp = client.post(
+        '/yt/control/comment',
+        json={
+            'video_id': 'vid-123',
+            'parent_comment_id': 'comment-parent-1',
+            'text': 'Replying with a PMOVES follow-up',
+            'execute': True,
+            'approved_by': 'discord-agent',
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data['status'] == 'executed'
+    assert data['action'] == 'comment_create'
+    assert data['details']['parent_comment_id'] == 'comment-parent-1'
+    assert data['result']['id'] == 'reply-1'
+    assert events[0][0] == 'creator.youtube.control.executed.v1'
+    assert audits[0]['status'] == 'executed'
+    assert audits[0]['action'] == 'comment_create'

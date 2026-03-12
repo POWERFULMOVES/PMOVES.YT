@@ -62,7 +62,7 @@ YouTube ingest helper that emits CHIT geometry after analysis.
 - `POST /yt/control/playlist/reorder`
   - preview or execute moving an existing playlist item to a new position
 - `POST /yt/control/comment`
-  - preview or execute a top-level comment or reply
+  - preview or execute a top-level comment or reply (`parent_comment_id` switches to reply mode)
 - These endpoints:
   - are protected by the same `X-API-Key` gate used by docs sync when API keys are configured
   - default to preview mode (`execute=false`)
