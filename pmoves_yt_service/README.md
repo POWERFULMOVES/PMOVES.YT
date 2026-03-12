@@ -60,6 +60,7 @@ YouTube ingest helper that emits CHIT geometry after analysis.
   - default to preview mode (`execute=false`)
   - require `approved_by` when `YT_CONTROL_REQUIRE_APPROVAL=true` and `execute=true`
   - use the YouTube Data API, not yt-dlp
+  - append audit records to `pmoves_core.youtube_control_actions` when the Supabase migration is applied
 
 ## Resilient Playlist Ingest (2025-10)
 

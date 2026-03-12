@@ -5,7 +5,9 @@ from pmoves_yt_service import yt as app_module
 
 def test_playlist_add_returns_preview_by_default(monkeypatch):
     events = []
+    audits = []
     monkeypatch.setattr(app_module, '_publish_event', lambda topic, payload: events.append((topic, payload)))
+    monkeypatch.setattr(app_module, '_record_control_action', lambda **kwargs: audits.append(kwargs))
 
     client = TestClient(app_module.app)
     resp = client.post(
@@ -22,6 +24,8 @@ def test_playlist_add_returns_preview_by_default(monkeypatch):
     assert data['action'] == 'playlist_add'
     assert data['details']['playlist_id'] == 'PL123'
     assert events[0][0] == 'creator.youtube.control.preview.v1'
+    assert audits[0]['status'] == 'preview'
+    assert audits[0]['action'] == 'playlist_add'
 
 
 def test_playlist_add_execute_requires_approval(monkeypatch):
@@ -43,7 +47,9 @@ def test_playlist_add_execute_requires_approval(monkeypatch):
 
 def test_comment_execute_uses_youtube_control_runtime(monkeypatch):
     events = []
+    audits = []
     monkeypatch.setattr(app_module, '_publish_event', lambda topic, payload: events.append((topic, payload)))
+    monkeypatch.setattr(app_module, '_record_control_action', lambda **kwargs: audits.append(kwargs))
     monkeypatch.setattr(app_module, 'YT_GOOGLE_CLIENT_ID', 'client-id')
     monkeypatch.setattr(app_module, 'YT_GOOGLE_CLIENT_SECRET', 'client-secret')
     monkeypatch.setattr(app_module, 'YT_GOOGLE_REFRESH_TOKEN', 'refresh-token')
@@ -73,3 +79,5 @@ def test_comment_execute_uses_youtube_control_runtime(monkeypatch):
     assert data['action'] == 'comment_create'
     assert data['result']['id'] == 'comment-1'
     assert events[0][0] == 'creator.youtube.control.executed.v1'
+    assert audits[0]['status'] == 'executed'
+    assert audits[0]['action'] == 'comment_create'

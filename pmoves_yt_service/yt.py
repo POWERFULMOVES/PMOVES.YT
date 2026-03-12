@@ -988,6 +988,7 @@ def _control_plane_status() -> dict[str, Any]:
         'google_client_configured': bool(YT_GOOGLE_CLIENT_ID and YT_GOOGLE_CLIENT_SECRET),
         'default_refresh_token_configured': bool(YT_GOOGLE_REFRESH_TOKEN),
         'approval_required': YT_CONTROL_REQUIRE_APPROVAL,
+        'audit_table': 'pmoves_core.youtube_control_actions',
     }
 
 
@@ -1009,6 +1010,7 @@ def _resolve_control_refresh_token(refresh_token: str | None) -> str:
 
 def _control_preview(action: str, body: YouTubeControlRequest, details: dict[str, Any]) -> dict[str, Any]:
     payload = {
+        'action_id': str(uuid.uuid4()),
         'action': action,
         'execute': body.execute,
         'approved_by': body.approved_by,
@@ -1020,6 +1022,39 @@ def _control_preview(action: str, body: YouTubeControlRequest, details: dict[str
     if not body.execute:
         _publish_event('creator.youtube.control.preview.v1', payload)
     return payload
+
+
+def _record_control_action(
+    *,
+    action_id: str,
+    action: str,
+    status: str,
+    body: YouTubeControlRequest,
+    details: dict[str, Any],
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    detail_payload = dict(details)
+    row = {
+        'id': action_id,
+        'action': action,
+        'status': status,
+        'execute_requested': bool(body.execute),
+        'request_source': body.request_source,
+        'approved_by': body.approved_by,
+        'approval_note': body.approval_note,
+        'video_id': detail_payload.get('video_id'),
+        'playlist_id': detail_payload.get('playlist_id'),
+        'parent_comment_id': detail_payload.get('parent_comment_id'),
+        'details': detail_payload,
+        'result': result,
+        'error': error,
+    }
+    if supa_insert('pmoves_core.youtube_control_actions', row) is None:
+        logger.warning(
+            'Failed to record YouTube control action audit',
+            extra={'action': action, 'status': status, 'action_id': action_id},
+        )
 
 
 def _execute_playlist_add(body: PlaylistItemAddRequest) -> dict[str, Any]:
@@ -3214,15 +3249,38 @@ async def yt_control_playlist_add(
         },
     )
     if not body.execute:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='playlist_add',
+            status='preview',
+            body=body,
+            details=preview['details'],
+        )
         return {'status': 'preview', **preview}
     try:
         result = await asyncio.to_thread(_execute_playlist_add, body)
     except YouTubeControlError as exc:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='playlist_add',
+            status='error',
+            body=body,
+            details=preview['details'],
+            error=str(exc),
+        )
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     payload = {
         **preview,
         'result': result,
     }
+    _record_control_action(
+        action_id=preview['action_id'],
+        action='playlist_add',
+        status='executed',
+        body=body,
+        details=preview['details'],
+        result=result,
+    )
     _publish_event('creator.youtube.control.executed.v1', payload)
     return {'status': 'executed', **payload}
 
@@ -3244,15 +3302,38 @@ async def yt_control_comment(
         },
     )
     if not body.execute:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='comment_create',
+            status='preview',
+            body=body,
+            details=preview['details'],
+        )
         return {'status': 'preview', **preview}
     try:
         result = await asyncio.to_thread(_execute_comment_create, body)
     except YouTubeControlError as exc:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='comment_create',
+            status='error',
+            body=body,
+            details=preview['details'],
+            error=str(exc),
+        )
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     payload = {
         **preview,
         'result': result,
     }
+    _record_control_action(
+        action_id=preview['action_id'],
+        action='comment_create',
+        status='executed',
+        body=body,
+        details=preview['details'],
+        result=result,
+    )
     _publish_event('creator.youtube.control.executed.v1', payload)
     return {'status': 'executed', **payload}
 
