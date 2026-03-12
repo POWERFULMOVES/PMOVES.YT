@@ -396,6 +396,7 @@ try:
     from .youtube_control import (
         YouTubeControlError,
         create_playlist,
+        delete_playlist,
         delete_playlist_item,
         insert_comment,
         insert_playlist_item,
@@ -407,6 +408,7 @@ except ImportError:  # pragma: no cover
     from youtube_control import (  # type: ignore
         YouTubeControlError,
         create_playlist,
+        delete_playlist,
         delete_playlist_item,
         insert_comment,
         insert_playlist_item,
@@ -1006,6 +1008,10 @@ class PlaylistItemRemoveRequest(YouTubeControlRequest):
     video_id: str | None = Field(None, description='Optional video ID for audit context')
 
 
+class PlaylistDeleteRequest(YouTubeControlRequest):
+    playlist_id: str = Field(..., description='Target YouTube playlist ID to delete')
+
+
 class PlaylistItemReorderRequest(YouTubeControlRequest):
     playlist_item_id: str = Field(..., description='Playlist item ID to reorder')
     playlist_id: str = Field(..., description='Target YouTube playlist ID')
@@ -1028,6 +1034,7 @@ def _control_plane_status() -> dict[str, Any]:
         'supported_actions': [
             'playlist_create',
             'playlist_update',
+            'playlist_delete',
             'playlist_add',
             'playlist_remove',
             'playlist_reorder',
@@ -1155,6 +1162,18 @@ def _execute_playlist_remove(body: PlaylistItemRemoveRequest) -> dict[str, Any]:
     return delete_playlist_item(
         access_token=access_token,
         playlist_item_id=body.playlist_item_id,
+    )
+
+
+def _execute_playlist_delete(body: PlaylistDeleteRequest) -> dict[str, Any]:
+    access_token = refresh_access_token(
+        client_id=YT_GOOGLE_CLIENT_ID,
+        client_secret=YT_GOOGLE_CLIENT_SECRET,
+        refresh_token=_resolve_control_refresh_token(body.refresh_token),
+    )
+    return delete_playlist(
+        access_token=access_token,
+        playlist_id=body.playlist_id,
     )
 
 
@@ -3542,6 +3561,57 @@ async def yt_control_playlist_remove(
     _record_control_action(
         action_id=preview['action_id'],
         action='playlist_remove',
+        status='executed',
+        body=body,
+        details=preview['details'],
+        result=result,
+    )
+    _publish_event('creator.youtube.control.executed.v1', payload)
+    return {'status': 'executed', **payload}
+
+
+@app.post('/yt/control/playlist/delete')
+async def yt_control_playlist_delete(
+    body: PlaylistDeleteRequest,
+    _: None = Depends(require_control_plane_access),
+) -> dict[str, Any]:
+    """Preview or execute deleting an owned playlist via YouTube Data API."""
+    _ensure_control_execute_allowed(body.execute, body.approved_by)
+    preview = _control_preview(
+        'playlist_delete',
+        body,
+        {
+            'playlist_id': body.playlist_id,
+        },
+    )
+    if not body.execute:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='playlist_delete',
+            status='preview',
+            body=body,
+            details=preview['details'],
+        )
+        return {'status': 'preview', **preview}
+    try:
+        result = await asyncio.to_thread(_execute_playlist_delete, body)
+    except YouTubeControlError as exc:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='playlist_delete',
+            status='error',
+            body=body,
+            details=preview['details'],
+            error=str(exc),
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    payload = {
+        **preview,
+        'result': result,
+    }
+    _record_control_action(
+        action_id=preview['action_id'],
+        action='playlist_delete',
         status='executed',
         body=body,
         details=preview['details'],

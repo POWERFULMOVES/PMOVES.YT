@@ -141,6 +141,22 @@ def update_playlist(
     return _check_response(response, 'update_playlist')
 
 
+def delete_playlist(
+    *,
+    access_token: str,
+    playlist_id: str,
+) -> dict[str, Any]:
+    response = requests.delete(
+        f'{YOUTUBE_API_BASE}/playlists',
+        params={'id': playlist_id},
+        headers={'Authorization': f'Bearer {access_token}'},
+        timeout=30,
+    )
+    if response.status_code >= 400:
+        _check_response(response, 'delete_playlist')
+    return {'id': playlist_id, 'deleted': True}
+
+
 def delete_playlist_item(
     *,
     access_token: str,
