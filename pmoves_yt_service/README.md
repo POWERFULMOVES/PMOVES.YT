@@ -53,6 +53,10 @@ YouTube ingest helper that emits CHIT geometry after analysis.
   - reports whether Google client credentials, a default refresh token, and approval gating are configured
 - `POST /yt/control/playlist/add`
   - preview or execute adding a video to a playlist
+- `POST /yt/control/playlist/remove`
+  - preview or execute removing an item from a playlist
+- `POST /yt/control/playlist/reorder`
+  - preview or execute moving an existing playlist item to a new position
 - `POST /yt/control/comment`
   - preview or execute a top-level comment or reply
 - These endpoints:
@@ -61,6 +65,8 @@ YouTube ingest helper that emits CHIT geometry after analysis.
   - require `approved_by` when `YT_CONTROL_REQUIRE_APPROVAL=true` and `execute=true`
   - use the YouTube Data API, not yt-dlp
   - append audit records to `pmoves_core.youtube_control_actions` when the Supabase migration is applied
+  - are designed to receive review-filtered payloads from `channel-monitor`, which now strips
+    notebook/draft metadata before the live YouTube API call
 
 ## Resilient Playlist Ingest (2025-10)
 

@@ -395,16 +395,20 @@ except ImportError:  # pragma: no cover
 try:
     from .youtube_control import (
         YouTubeControlError,
+        delete_playlist_item,
         insert_comment,
         insert_playlist_item,
         refresh_access_token,
+        update_playlist_item_position,
     )
 except ImportError:  # pragma: no cover
     from youtube_control import (  # type: ignore
         YouTubeControlError,
+        delete_playlist_item,
         insert_comment,
         insert_playlist_item,
         refresh_access_token,
+        update_playlist_item_position,
     )
 try:
     from .docs_catalog import options_catalog, extractor_count, version_info  # type: ignore
@@ -977,6 +981,19 @@ class PlaylistItemAddRequest(YouTubeControlRequest):
     position: int | None = Field(None, description='Optional target position inside the playlist')
 
 
+class PlaylistItemRemoveRequest(YouTubeControlRequest):
+    playlist_item_id: str = Field(..., description='Playlist item ID to remove')
+    playlist_id: str | None = Field(None, description='Optional playlist ID for audit context')
+    video_id: str | None = Field(None, description='Optional video ID for audit context')
+
+
+class PlaylistItemReorderRequest(YouTubeControlRequest):
+    playlist_item_id: str = Field(..., description='Playlist item ID to reorder')
+    playlist_id: str = Field(..., description='Target YouTube playlist ID')
+    video_id: str = Field(..., description='YouTube video ID bound to the playlist item')
+    position: int = Field(..., ge=0, description='Target zero-based playlist position')
+
+
 class CommentCreateRequest(YouTubeControlRequest):
     video_id: str = Field(..., description='Target YouTube video ID')
     text: str = Field(..., min_length=1, description='Comment or reply text')
@@ -989,6 +1006,12 @@ def _control_plane_status() -> dict[str, Any]:
         'default_refresh_token_configured': bool(YT_GOOGLE_REFRESH_TOKEN),
         'approval_required': YT_CONTROL_REQUIRE_APPROVAL,
         'audit_table': 'pmoves_core.youtube_control_actions',
+        'supported_actions': [
+            'playlist_add',
+            'playlist_remove',
+            'playlist_reorder',
+            'comment_create',
+        ],
     }
 
 
@@ -1065,6 +1088,33 @@ def _execute_playlist_add(body: PlaylistItemAddRequest) -> dict[str, Any]:
     )
     return insert_playlist_item(
         access_token=access_token,
+        playlist_id=body.playlist_id,
+        video_id=body.video_id,
+        position=body.position,
+    )
+
+
+def _execute_playlist_remove(body: PlaylistItemRemoveRequest) -> dict[str, Any]:
+    access_token = refresh_access_token(
+        client_id=YT_GOOGLE_CLIENT_ID,
+        client_secret=YT_GOOGLE_CLIENT_SECRET,
+        refresh_token=_resolve_control_refresh_token(body.refresh_token),
+    )
+    return delete_playlist_item(
+        access_token=access_token,
+        playlist_item_id=body.playlist_item_id,
+    )
+
+
+def _execute_playlist_reorder(body: PlaylistItemReorderRequest) -> dict[str, Any]:
+    access_token = refresh_access_token(
+        client_id=YT_GOOGLE_CLIENT_ID,
+        client_secret=YT_GOOGLE_CLIENT_SECRET,
+        refresh_token=_resolve_control_refresh_token(body.refresh_token),
+    )
+    return update_playlist_item_position(
+        access_token=access_token,
+        playlist_item_id=body.playlist_item_id,
         playlist_id=body.playlist_id,
         video_id=body.video_id,
         position=body.position,
@@ -3276,6 +3326,113 @@ async def yt_control_playlist_add(
     _record_control_action(
         action_id=preview['action_id'],
         action='playlist_add',
+        status='executed',
+        body=body,
+        details=preview['details'],
+        result=result,
+    )
+    _publish_event('creator.youtube.control.executed.v1', payload)
+    return {'status': 'executed', **payload}
+
+
+@app.post('/yt/control/playlist/remove')
+async def yt_control_playlist_remove(
+    body: PlaylistItemRemoveRequest,
+    _: None = Depends(require_control_plane_access),
+) -> dict[str, Any]:
+    """Preview or execute removing a playlist item via YouTube Data API."""
+    _ensure_control_execute_allowed(body.execute, body.approved_by)
+    preview = _control_preview(
+        'playlist_remove',
+        body,
+        {
+            'playlist_item_id': body.playlist_item_id,
+            'playlist_id': body.playlist_id,
+            'video_id': body.video_id,
+        },
+    )
+    if not body.execute:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='playlist_remove',
+            status='preview',
+            body=body,
+            details=preview['details'],
+        )
+        return {'status': 'preview', **preview}
+    try:
+        result = await asyncio.to_thread(_execute_playlist_remove, body)
+    except YouTubeControlError as exc:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='playlist_remove',
+            status='error',
+            body=body,
+            details=preview['details'],
+            error=str(exc),
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    payload = {
+        **preview,
+        'result': result,
+    }
+    _record_control_action(
+        action_id=preview['action_id'],
+        action='playlist_remove',
+        status='executed',
+        body=body,
+        details=preview['details'],
+        result=result,
+    )
+    _publish_event('creator.youtube.control.executed.v1', payload)
+    return {'status': 'executed', **payload}
+
+
+@app.post('/yt/control/playlist/reorder')
+async def yt_control_playlist_reorder(
+    body: PlaylistItemReorderRequest,
+    _: None = Depends(require_control_plane_access),
+) -> dict[str, Any]:
+    """Preview or execute reordering a playlist item via YouTube Data API."""
+    _ensure_control_execute_allowed(body.execute, body.approved_by)
+    preview = _control_preview(
+        'playlist_reorder',
+        body,
+        {
+            'playlist_item_id': body.playlist_item_id,
+            'playlist_id': body.playlist_id,
+            'video_id': body.video_id,
+            'position': body.position,
+        },
+    )
+    if not body.execute:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='playlist_reorder',
+            status='preview',
+            body=body,
+            details=preview['details'],
+        )
+        return {'status': 'preview', **preview}
+    try:
+        result = await asyncio.to_thread(_execute_playlist_reorder, body)
+    except YouTubeControlError as exc:
+        _record_control_action(
+            action_id=preview['action_id'],
+            action='playlist_reorder',
+            status='error',
+            body=body,
+            details=preview['details'],
+            error=str(exc),
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    payload = {
+        **preview,
+        'result': result,
+    }
+    _record_control_action(
+        action_id=preview['action_id'],
+        action='playlist_reorder',
         status='executed',
         body=body,
         details=preview['details'],
