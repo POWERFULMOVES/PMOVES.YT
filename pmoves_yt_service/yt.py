@@ -802,7 +802,7 @@ def _with_ytdlp_defaults(opts: dict[str, Any], *, po_token: str | None = None) -
         merged['extractor_retries'] = YT_EXTRACTOR_RETRIES
     merged.setdefault('continuedl', True)
     merged.setdefault('nooverwrites', True)
-    merged.setdefault('format', 'best')
+    merged.setdefault('format', 'bestvideo+bestaudio/best')
     merged.setdefault('merge_output_format', 'mp4')
     merged.setdefault('noplaylist', True)
     merged.setdefault('hls_prefer_native', True)
