@@ -616,6 +616,7 @@ else:
     YT_TRANSCRIPT_DIARIZE = False if parsed is None else parsed
 
 _nc: NATS | None = None
+_nc_loop: asyncio.AbstractEventLoop | None = None  # event loop where NATS client lives
 _nc_connect_task: asyncio.Task | None = None
 _periodic_docs_task: asyncio.Task | None = None
 
@@ -891,6 +892,8 @@ async def _nats_connect_loop() -> None:
                 closed_cb=_handle_closed,
             )
             _nc = nc
+            global _nc_loop
+            _nc_loop = asyncio.get_running_loop()
             logger.info('Connected to NATS at %s', NATS_URL)
             backoff = 1.0
             await closed_event.wait()
@@ -970,7 +973,15 @@ def _publish_event(topic: str, payload: dict[str, Any]):
 
     msg = envelope(topic, payload, source='pmoves-yt')
     try:
-        _track_background_task(asyncio.create_task(nc.publish(topic, json.dumps(msg).encode())))
+        data = json.dumps(msg).encode()
+        loop = _nc_loop
+        if loop is not None and loop.is_running():
+            # Thread-safe scheduling: works from both async and sync contexts
+            fut = asyncio.run_coroutine_threadsafe(nc.publish(topic, data), loop)
+            fut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
+        else:
+            logger.warning('No running event loop for NATS publish on topic %s', topic)
+            return
         nats_messages_total.labels(subject=topic.replace('.', '_')).inc()
     except Exception as exc:
         logger.exception('Failed to schedule publish for topic %s: %s', topic, exc)
