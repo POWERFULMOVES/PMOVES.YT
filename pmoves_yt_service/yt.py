@@ -4621,10 +4621,14 @@ def yt_emit(background_tasks: BackgroundTasks, body: dict[str, Any] = Body(...))
     except Exception as exc:
         raise HTTPException(502, f'upsert-batch failed: {exc}')
 
+    cgp_ok = False
     try:
         _emit_geometry_event(vid, chunks, title, ns)
+        cgp_ok = True
     except Exception as exc:
-        raise HTTPException(502, f'CGP emit failed: {exc}')
+        # Geometry event is supplementary (real-time notification) — don't abort
+        # the whole emit if CHIT signature verification or connectivity fails.
+        logger.warning('CGP geometry emit failed (non-fatal): %s', exc)
 
     return {
         'ok': True,
@@ -4632,6 +4636,7 @@ def yt_emit(background_tasks: BackgroundTasks, body: dict[str, Any] = Body(...))
         'chunks': len(chunks),
         'upserted': up.get('upserted'),
         'lexical_indexed': up.get('lexical_indexed'),
+        'cgp_ok': cgp_ok,
         'profile': (tuned or {}).get('profile') if tuned else None,
         'lexical_auto_disabled': lexical_auto_disabled,
     }
