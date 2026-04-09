@@ -4356,6 +4356,23 @@ def _geometry_url_candidates() -> list[str]:
     return candidates
 
 
+def _sign_cgp(cgp: dict[str, Any]) -> dict[str, Any]:
+    """CHIT HMAC-SHA256 signing for CGP payloads. Non-fatal if passphrase unset."""
+    passphrase = os.environ.get('CHIT_PASSPHRASE', '')
+    if not passphrase:
+        logger.debug('CHIT_PASSPHRASE not set; emitting unsigned CGP')
+        return cgp
+    import hmac as _hmac, hashlib as _hashlib, base64 as _b64
+    doc = json.loads(json.dumps(cgp))
+    kid = _hashlib.sha256(passphrase.encode()).hexdigest()[:16]
+    doc_nosig = json.loads(json.dumps(doc))
+    doc_nosig.pop('sig', None)
+    canon = json.dumps(doc_nosig, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    mac = _hmac.new(passphrase.encode('utf-8'), canon, _hashlib.sha256).digest()
+    doc['sig'] = {'alg': 'HMAC-SHA256', 'kid': kid, 'hmac': _b64.b64encode(mac).decode('ascii')}
+    return doc
+
+
 def _emit_geometry_event(
     video_id: str,
     chunks: list[dict[str, Any]],
@@ -4363,6 +4380,7 @@ def _emit_geometry_event(
     namespace: str,
 ) -> None:
     cgp = _build_cgp(video_id, chunks, title, namespace)
+    cgp = _sign_cgp(cgp)
     payload = {'type': 'geometry.cgp.v1', 'data': cgp}
     last_error: Exception | None = None
     for base in _geometry_url_candidates():
