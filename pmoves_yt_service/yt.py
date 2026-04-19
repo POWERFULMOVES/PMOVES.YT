@@ -257,6 +257,26 @@ nats_messages_total = Counter(
     ['subject'],
     registry=PROM_REGISTRY,
 )
+# Phase 9C: per-client download fallback chain metrics.
+# `client` label values: yt-dlp, invidious-companion, invidious-public.
+yt_download_attempts_total = Counter(
+    'pmoves_yt_download_attempts_total',
+    'YT download attempts by client (each fallback step counts as one attempt)',
+    ['client'],
+    registry=PROM_REGISTRY,
+)
+yt_download_success_total = Counter(
+    'pmoves_yt_download_success_total',
+    'YT download successes by client (the client that ultimately produced the file)',
+    ['client'],
+    registry=PROM_REGISTRY,
+)
+yt_download_failure_total = Counter(
+    'pmoves_yt_download_failure_total',
+    'YT download failures by client (each client that errored before fallback)',
+    ['client'],
+    registry=PROM_REGISTRY,
+)
 
 
 @asynccontextmanager
@@ -2368,26 +2388,138 @@ def yt_download(body: dict[str, Any] = Body(...)):
         if value is not None:
             ydl_opts[key] = value
     _apply_provider_defaults(platform, ydl_opts)
+    # Phase 9C: structured fallback chain with per-client metrics.
+    # Each step is one client. yt-dlp itself rotates internal player_clients
+    # (web/mweb/android/ios/tv_embedded) inside _download_with_yt_dlp; if that
+    # whole rotation fails with an auth-shaped error, we walk the chain
+    # companion → public so a single client's outage does not block ingest.
+    return _download_with_fallback_chain(
+        url=url,
+        ns=ns,
+        bucket=bucket,
+        ydl_opts=ydl_opts,
+        postprocessors=postprocessors,
+        write_info_json=write_info_json,
+        job_id=job_id,
+        entry_meta=entry_meta,
+        platform=platform,
+    )
+
+
+def _emit_cookies_invalid(url: str, video_id: str | None, client: str, err_text: str) -> None:
+    """Publish cookies.invalid signal so the cookie-writer can request a refresh.
+
+    Best-effort — _publish_event already silently no-ops if NATS is down. The
+    yt-cookie-writer subscribes to this subject and POSTs to the refresher's
+    /refresh endpoint, completing the auto-recovery loop without manual ops.
+    """
+    payload: dict[str, Any] = {
+        'video_url': url,
+        'video_id': video_id,
+        'client': client,
+        'error': err_text[:300],
+    }
     try:
-        return _download_with_yt_dlp(url, ns, bucket, ydl_opts, postprocessors, write_info_json, job_id, entry_meta, platform)
+        _publish_event('ingest.cookies.invalid.v1', payload)
+    except Exception:  # noqa: BLE001 — never let a metrics emit break ingest
+        logger.debug('failed to emit ingest.cookies.invalid.v1', exc_info=True)
+
+
+def _download_with_fallback_chain(
+    *,
+    url: str,
+    ns: str,
+    bucket: str,
+    ydl_opts: dict[str, Any],
+    postprocessors: list,
+    write_info_json: bool,
+    job_id: str | None,
+    entry_meta: dict[str, Any],
+    platform: str,
+) -> dict[str, Any]:
+    """Try yt-dlp → invidious-companion → invidious-public, recording metrics.
+
+    yt-dlp internal player_client rotation handles the first tier (configured
+    via YT_PLAYER_CLIENT). When auth-shaped errors propagate out of the whole
+    rotation, the next two clients are tried only when:
+      * platform is YouTube (other extractors don't have an Invidious fallback)
+      * the error matches the auth/blocking signatures in _should_use_invidious
+
+    Each client outcome lands in pmoves_yt_download_{attempts,success,failure}
+    so dashboards can show which provider is keeping the pipeline alive.
+    """
+    video_id = _extract_video_id(url)
+
+    # --- Tier 1: yt-dlp with internal player_client rotation -------------
+    yt_download_attempts_total.labels(client='yt-dlp').inc()
+    try:
+        result = _download_with_yt_dlp(
+            url, ns, bucket, ydl_opts, postprocessors, write_info_json,
+            job_id, entry_meta, platform,
+        )
+        yt_download_success_total.labels(client='yt-dlp').inc()
+        return result
     except (DownloadError, PostProcessingError) as err:
-        if platform == 'youtube' and _should_use_invidious(err):
-            logger.warning('yt-dlp failed, attempting fallback', extra={'video_id': _extract_video_id(url), 'error': str(err)})
-            if YT_COMPANION_ENABLED and INVIDIOUS_COMPANION_URL and INVIDIOUS_COMPANION_KEY:
-                try:
-                    return _download_with_companion(url, ns, bucket, job_id, entry_meta, platform)
-                except HTTPException as companion_exc:
-                    logger.exception('companion fallback failed', extra={'video_id': _extract_video_id(url), 'error': str(companion_exc)})
-                    raise companion_exc
-            if INVIDIOUS_BASE_URL:
-                return _download_with_invidious(url, ns, bucket, job_id, entry_meta, platform)
-            logger.warning('No Invidious fallback configured; propagating yt-dlp error', extra={'video_id': _extract_video_id(url)})
+        yt_download_failure_total.labels(client='yt-dlp').inc()
+        # Non-YouTube platforms (SoundCloud, etc.) have no Invidious fallback.
+        if platform != 'youtube' or not _should_use_invidious(err):
             raise HTTPException(500, f'yt-dlp error: {err}') from err
-        raise HTTPException(500, f'yt-dlp error: {err}') from err
+        # Auth-shaped error → notify the cookie pipeline (best-effort) so the
+        # next refresh harvests fresh cookies before the cron tick.
+        _emit_cookies_invalid(url, video_id, 'yt-dlp', str(err))
+        logger.warning(
+            'yt-dlp failed, attempting Invidious fallback chain',
+            extra={'video_id': video_id, 'error': str(err)[:200]},
+        )
+        primary_err: Exception = err
     except HTTPException:
+        # Already an HTTPException (e.g. from upload_to_s3) — preserve as-is.
         raise
     except Exception as exc:
+        yt_download_failure_total.labels(client='yt-dlp').inc()
         raise HTTPException(500, f'yt-dlp error: {exc}') from exc
+
+    # --- Tier 2: Invidious Companion (authenticated, fresh player response) ---
+    if YT_COMPANION_ENABLED and INVIDIOUS_COMPANION_URL and INVIDIOUS_COMPANION_KEY:
+        yt_download_attempts_total.labels(client='invidious-companion').inc()
+        try:
+            result = _download_with_companion(url, ns, bucket, job_id, entry_meta, platform)
+            yt_download_success_total.labels(client='invidious-companion').inc()
+            return result
+        except HTTPException as companion_exc:
+            yt_download_failure_total.labels(client='invidious-companion').inc()
+            logger.warning(
+                'invidious-companion fallback failed; trying public Invidious',
+                extra={'video_id': video_id, 'error': str(companion_exc)[:200]},
+            )
+            # Don't re-raise yet — fall through to Tier 3 if available.
+
+    # --- Tier 3: Plain public Invidious (last resort) ---------------------
+    if INVIDIOUS_BASE_URL:
+        yt_download_attempts_total.labels(client='invidious-public').inc()
+        try:
+            result = _download_with_invidious(url, ns, bucket, job_id, entry_meta, platform)
+            yt_download_success_total.labels(client='invidious-public').inc()
+            return result
+        except HTTPException as public_exc:
+            yt_download_failure_total.labels(client='invidious-public').inc()
+            logger.warning(
+                'invidious-public fallback also failed; chain exhausted',
+                extra={'video_id': video_id, 'error': str(public_exc)[:200]},
+            )
+            # Surface the original yt-dlp error — that's the most diagnostic;
+            # the Invidious failures are downstream symptoms of the same problem.
+            raise HTTPException(
+                502,
+                f'All YT download clients exhausted. Primary yt-dlp error: {primary_err}',
+            ) from primary_err
+
+    # No Invidious fallback configured — surface the yt-dlp failure.
+    logger.warning(
+        'No Invidious fallback configured; propagating yt-dlp error',
+        extra={'video_id': video_id},
+    )
+    raise HTTPException(500, f'yt-dlp error: {primary_err}') from primary_err
 
 
 @app.post('/yt/transcript')
@@ -4362,7 +4494,9 @@ def _sign_cgp(cgp: dict[str, Any]) -> dict[str, Any]:
     if not passphrase:
         logger.debug('CHIT_PASSPHRASE not set; emitting unsigned CGP')
         return cgp
-    import hmac as _hmac, hashlib as _hashlib, base64 as _b64
+    import base64 as _b64
+    import hashlib as _hashlib
+    import hmac as _hmac
     doc = json.loads(json.dumps(cgp))
     kid = _hashlib.sha256(passphrase.encode()).hexdigest()[:16]
     doc_nosig = json.loads(json.dumps(doc))
