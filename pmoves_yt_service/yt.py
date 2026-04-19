@@ -4494,7 +4494,9 @@ def _sign_cgp(cgp: dict[str, Any]) -> dict[str, Any]:
     if not passphrase:
         logger.debug('CHIT_PASSPHRASE not set; emitting unsigned CGP')
         return cgp
-    import hmac as _hmac, hashlib as _hashlib, base64 as _b64
+    import base64 as _b64
+    import hashlib as _hashlib
+    import hmac as _hmac
     doc = json.loads(json.dumps(cgp))
     kid = _hashlib.sha256(passphrase.encode()).hexdigest()[:16]
     doc_nosig = json.loads(json.dumps(doc))
