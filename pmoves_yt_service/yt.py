@@ -2438,6 +2438,17 @@ def yt_download(body: dict[str, Any] = Body(...)):
     entry_meta.setdefault('platform', platform)
     if not url:
         raise HTTPException(400, 'url required')
+    # Pre-fetch metadata via Data API (IP-safe) so it enriches the download
+    # record even when yt-dlp gets bot-checked or returns sparse metadata.
+    video_id_hint = _extract_video_id(url)
+    if video_id_hint:
+        api_meta = _fetch_metadata_via_data_api(video_id_hint)
+        if api_meta:
+            for k in ('title', 'uploader', 'duration', 'description', 'tags', 'upload_date'):
+                entry_meta.setdefault(k, api_meta.get(k))
+            entry_meta.setdefault('data_api_meta', {
+                k: api_meta.get(k) for k in ('view_count', 'like_count') if api_meta.get(k) is not None
+            })
     YT_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
     outtmpl = os.path.join(str(YT_TEMP_ROOT), '%(id)s', '%(id)s.%(ext)s')
     yt_options = body.get('yt_options') or {}

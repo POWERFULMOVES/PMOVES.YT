@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/opt/pmoves-yt
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg atomicparsley ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=denoland/deno:bin-2.1.4 /deno /usr/local/bin/deno
+COPY --from=denoland/deno:bin-2.3.3 /deno /usr/local/bin/deno
 COPY . /opt/pmoves-yt
 # Parameterize yt-dlp so operators can still override the packaged fork when needed.
 ARG YTDLP_VERSION=
