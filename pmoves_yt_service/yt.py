@@ -618,6 +618,9 @@ YT_COMPANION_ENABLED = os.environ.get('YT_COMPANION_ENABLED', 'true').lower() in
 YT_PO_TOKEN_VALUE = os.environ.get('YT_PO_TOKEN_VALUE')
 YT_PO_TOKEN_CONTEXT = (os.environ.get('YT_PO_TOKEN_CONTEXT') or '').strip()
 YT_PO_TOKEN_ITAG = os.environ.get('YT_PO_TOKEN_ITAG', '18')
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID') or os.environ.get('CHANNEL_MONITOR_GOOGLE_CLIENT_ID')
+GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET') or os.environ.get('CHANNEL_MONITOR_GOOGLE_CLIENT_SECRET')
+YT_REFRESH_TOKEN_PATH = os.environ.get('YT_REFRESH_TOKEN_PATH', '/app/config/cookies/yt-refresh-token.txt')
 try:
     YT_UPSERT_BATCH_SIZE = max(1, int(os.environ.get('YT_UPSERT_BATCH_SIZE', '200')))
 except ValueError:
@@ -2234,6 +2237,117 @@ def _download_with_invidious(
     return {'ok': True, 'title': title, 'video_id': video_id, 's3_url': s3_url, 'thumb': thumb_s3}
 
 
+_data_api_access_token: str | None = None
+_data_api_token_expires: float = 0
+
+
+def _get_data_api_access_token() -> str | None:
+    """Exchange the stored refresh token for a Data API access token.
+
+    Uses the OAuth refresh token written by yt-cookie-writer to the shared
+    cookie volume. This bypasses yt-dlp's direct YouTube extraction, which
+    gets bot-checked on datacenter IPs.
+    """
+    global _data_api_access_token, _data_api_token_expires
+    import time
+    if _data_api_access_token and time.time() < _data_api_token_expires - 60:
+        return _data_api_access_token
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        return None
+    try:
+        token_path = Path(YT_REFRESH_TOKEN_PATH)
+        refresh_token = token_path.read_text().strip()
+    except (OSError, FileNotFoundError):
+        return None
+    if not refresh_token:
+        return None
+    try:
+        resp = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+            timeout=15,
+        )
+        data = resp.json()
+        token = data.get("access_token")
+        if not token:
+            return None
+        _data_api_access_token = token
+        _data_api_token_expires = time.time() + int(data.get("expires_in", 3600))
+        return token
+    except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
+        print(f"[yt] Data API token exchange failed: {e}", flush=True)
+        return None
+
+
+def _parse_iso8601_duration(duration: str) -> float | None:
+    """Parse ISO 8601 duration (PT#H#M#S) to seconds."""
+    if not duration or not duration.startswith("PT"):
+        return None
+    total = 0.0
+    current = ""
+    mult = {"H": 3600, "M": 60, "S": 1}
+    for ch in duration[2:]:
+        if ch.isdigit() or ch == ".":
+            current += ch
+        elif ch in mult and current:
+            total += float(current) * mult[ch]
+            current = ""
+    return total or None
+
+
+def _fetch_metadata_via_data_api(video_id: str) -> dict[str, Any] | None:
+    """Fetch video metadata via YouTube Data API v3.
+
+    Works from datacenter IPs (no bot detection). Requires the OAuth refresh
+    token from the cookie pipeline. Returns yt-dlp-compatible metadata dict.
+    """
+    token = _get_data_api_access_token()
+    if not token:
+        return None
+    try:
+        resp = requests.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={
+                "part": "snippet,contentDetails,statistics",
+                "id": video_id,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        data = resp.json()
+        items = data.get("items", [])
+        if not items:
+            return None
+        item = items[0]
+        snippet = item.get("snippet", {})
+        details = item.get("contentDetails", {})
+        stats = item.get("statistics", {})
+        vid = item.get("id", video_id)
+        duration = _parse_iso8601_duration(details.get("duration", ""))
+        return {
+            "id": vid,
+            "title": snippet.get("title"),
+            "uploader": snippet.get("channelTitle"),
+            "duration": duration,
+            "webpage_url": f"https://www.youtube.com/watch?v={vid}",
+            "description": snippet.get("description", ""),
+            "view_count": int(stats.get("viewCount", 0)) if stats.get("viewCount") else None,
+            "like_count": int(stats.get("likeCount", 0)) if stats.get("likeCount") else None,
+            "upload_date": snippet.get("publishedAt", "")[:10] or None,
+            "channel": snippet.get("channelTitle"),
+            "tags": snippet.get("tags", []),
+        }
+    except Exception:
+        return None
+
+
 @app.post('/yt/info')
 def yt_info(body: dict[str, Any] = Body(...)):
     """Fetch video metadata without downloading.
@@ -2253,6 +2367,12 @@ def yt_info(body: dict[str, Any] = Body(...)):
     url = body.get('url')
     if not url:
         raise HTTPException(400, 'url required')
+    video_id = _extract_video_id(url)
+    if video_id:
+        api_info = _fetch_metadata_via_data_api(video_id)
+        if api_info:
+            wanted = {k: api_info.get(k) for k in ('id', 'title', 'uploader', 'duration', 'webpage_url')}
+            return {'ok': True, 'info': wanted, 'source': 'data_api'}
     ydl_opts = _with_ytdlp_defaults({'quiet': True, 'noprogress': True, 'skip_download': True})
     # Metadata probes must not force a playable/download format because
     # upstream extractor availability can vary and cause false 500s.
