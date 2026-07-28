@@ -1785,6 +1785,11 @@ def _download_with_yt_dlp(
         with _youtube_dl(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if info is None:
+                if ydl_opts.get('download_archive'):
+                    raise DownloadError(
+                        f'Video already in download archive (skipped by yt-dlp): {url}. '
+                        f'Clear archive entry or disable download_archive to re-download.'
+                    )
                 raise DownloadError(f'yt_dlp returned no info for {url}')
             if info.get('requested_downloads'):
                 rd = info['requested_downloads'][0]
